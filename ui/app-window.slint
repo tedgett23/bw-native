@@ -1,0 +1,111 @@
+import { Button, LineEdit } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    preferred-width: 500px;
+    preferred-height: 460px;
+    min-width: 420px;
+    min-height: 400px;
+    title: "Bitwarden Login";
+
+    callback login-requested();
+    in-out property <string> server-url: "https://vault.bitwarden.com";
+    in-out property <string> username;
+    in-out property <string> password;
+    in-out property <string> status-text;
+    in-out property <bool> status-is-error;
+    in-out property <bool> is-logging-in;
+
+    Rectangle {
+        background: #f3f5f8;
+
+        Rectangle {
+            x: 40px;
+            y: 40px;
+            width: parent.width - 80px;
+            height: parent.height - 80px;
+            background: #ffffff;
+            border-width: 1px;
+            border-color: #d2d8e1;
+            border-radius: 10px;
+
+            VerticalLayout {
+                padding-left: 24px;
+                padding-right: 24px;
+                padding-top: 20px;
+                padding-bottom: 20px;
+                spacing: 12px;
+
+                Text {
+                    text: "Sign in to Bitwarden";
+                    color: #1b2533;
+                    font-size: 24px;
+                    font-weight: 700;
+                }
+
+                Text {
+                    text: "Use cloud or a self-hosted server.";
+                    color: #4a5a70;
+                    font-size: 14px;
+                }
+
+                Text {
+                    text: "Server URL";
+                    color: #1b2533;
+                    font-size: 14px;
+                }
+
+                LineEdit {
+                    text <=> root.server-url;
+                    placeholder-text: "https://vault.bitwarden.com";
+                    enabled: !root.is-logging-in;
+                }
+
+                Text {
+                    text: "Username";
+                    color: #1b2533;
+                    font-size: 14px;
+                }
+
+                LineEdit {
+                    text <=> root.username;
+                    placeholder-text: "name@example.com";
+                    enabled: !root.is-logging-in;
+                }
+
+                Text {
+                    text: "Password";
+                    color: #1b2533;
+                    font-size: 14px;
+                }
+
+                LineEdit {
+                    text <=> root.password;
+                    placeholder-text: "Enter your password";
+                    input-type: InputType.password;
+                    enabled: !root.is-logging-in;
+                }
+
+                Rectangle {
+                    height: 8px;
+                    background: transparent;
+                }
+
+                Text {
+                    text: root.status-text;
+                    color: root.status-is-error ? #b21f2d : #1f6f43;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                    visible: root.status-text != "";
+                }
+
+                Button {
+                    text: root.is-logging-in ? "Logging in..." : "Log in";
+                    enabled: !root.is-logging-in;
+                    clicked => {
+                        root.login-requested();
+                    }
+                }
+            }
+        }
+    }
+}
