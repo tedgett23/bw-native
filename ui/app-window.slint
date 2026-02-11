@@ -26,6 +26,8 @@ export component MainWindow inherits Window {
     background: root.color-bg-app;
 
     callback login-requested();
+    callback sso-login-requested();
+    callback sso-master-password-submitted();
     init => {
         Palette.color-scheme = ColorScheme.dark;
     }
@@ -48,6 +50,9 @@ export component MainWindow inherits Window {
     in-out property <bool> status-is-error;
     in-out property <bool> is-logging-in;
     in-out property <bool> is-vault-view;
+    in-out property <string> sso-identifier;
+    in-out property <bool> is-sso-awaiting-password;
+    in-out property <string> sso-master-password;
     in-out property <[CollectionTreeRow]> collection-tree-rows;
     in-out property <[VaultItemRow]> vault-item-rows;
     in-out property <string> search-query;
@@ -68,14 +73,14 @@ export component MainWindow inherits Window {
 
         Rectangle {
             width: parent.width > 700px ? 620px : parent.width - 80px;
-            height: parent.height > 600px ? 520px : parent.height - 80px;
+            height: parent.height > 700px ? 620px : parent.height - 80px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: root.color-bg-panel;
             border-width: 1px;
             border-color: root.color-border;
             border-radius: 10px;
-            visible: !root.is-vault-view;
+            visible: !root.is-vault-view && !root.is-sso-awaiting-password;
 
             VerticalLayout {
                 padding-left: 24px;
@@ -135,7 +140,7 @@ export component MainWindow inherits Window {
                 }
 
                 Rectangle {
-                    height: 8px;
+                    height: 4px;
                     background: transparent;
                 }
 
@@ -152,6 +157,101 @@ export component MainWindow inherits Window {
                     enabled: !root.is-logging-in;
                     clicked => {
                         root.login-requested();
+                    }
+                }
+
+                Rectangle {
+                    height: 1px;
+                    background: root.color-border;
+                }
+
+                Text {
+                    text: "Enterprise Single Sign-On";
+                    color: root.color-text-primary;
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+
+                Text {
+                    text: "SSO Identifier";
+                    color: root.color-text-primary;
+                    font-size: 14px;
+                }
+
+                LineEdit {
+                    text <=> root.sso-identifier;
+                    placeholder-text: "Organization SSO identifier";
+                    enabled: !root.is-logging-in;
+                }
+
+                Button {
+                    text: root.is-logging-in ? "Logging in..." : "SSO Login";
+                    enabled: !root.is-logging-in;
+                    clicked => {
+                        root.sso-login-requested();
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            width: parent.width > 700px ? 480px : parent.width - 80px;
+            height: 320px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: root.color-bg-panel;
+            border-width: 1px;
+            border-color: root.color-border;
+            border-radius: 10px;
+            visible: root.is-sso-awaiting-password && !root.is-vault-view;
+
+            VerticalLayout {
+                padding-left: 24px;
+                padding-right: 24px;
+                padding-top: 20px;
+                padding-bottom: 20px;
+                spacing: 10px;
+
+                Text {
+                    text: "SSO Login — Master Password Required";
+                    color: root.color-text-primary;
+                    font-size: 20px;
+                    font-weight: 700;
+                }
+
+                Text {
+                    text: "SSO authentication succeeded. Enter your master password to decrypt the vault.";
+                    color: root.color-text-secondary;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: "Master Password";
+                    color: root.color-text-primary;
+                    font-size: 14px;
+                }
+
+                LineEdit {
+                    text <=> root.sso-master-password;
+                    placeholder-text: "Enter your master password";
+                    input-type: InputType.password;
+                    enabled: !root.is-logging-in;
+                }
+
+                Text {
+                    text: root.status-text;
+                    color: root.status-is-error ? root.color-error : root.color-success;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                    visible: root.status-text != "";
+                }
+
+                Button {
+                    text: root.is-logging-in ? "Decrypting vault..." : "Unlock";
+                    enabled: !root.is-logging-in;
+                    clicked => {
+                        root.sso-master-password-submitted();
                     }
                 }
             }

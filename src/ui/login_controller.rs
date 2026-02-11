@@ -4,9 +4,23 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
+use reqwest::blocking::Client;
 use sha1::Sha1;
 use sha2::{Sha256, Sha512};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+
+use crate::auth::sso::KdfConfigSnapshot;
+
+/// Holds the SSO token exchange result while waiting for the user to enter
+/// their master password to decrypt the vault.
+struct SsoPendingState {
+    access_token: String,
+    protected_user_key: String,
+    api_base_url: String,
+    kdf_config: KdfConfigSnapshot,
+    client: Client,
+    email: String,
+}
 
 #[derive(Clone, Default)]
 struct VaultItemUiState {
@@ -784,6 +798,224 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
             });
         });
     });
+
+    let sso_pending_state: Arc<Mutex<Option<SsoPendingState>>> = Arc::new(Mutex::new(None));
+
+    {
+        let weak_window = weak_window.clone();
+        let sso_pending_state = sso_pending_state.clone();
+
+        window.on_sso_login_requested(move || {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+
+            if window.get_is_logging_in() {
+                return;
+            }
+
+            let server_url = window.get_server_url().to_string();
+            let org_identifier = window.get_sso_identifier().to_string();
+            let email = window.get_username().to_string();
+
+            window.set_status_is_error(false);
+            window.set_status_text("Opening browser for SSO login...".into());
+            window.set_is_logging_in(true);
+
+            let weak_for_thread = weak_window.clone();
+            let sso_pending = sso_pending_state.clone();
+            thread::spawn(move || {
+                let result = crate::auth::try_sso_login(&server_url, &org_identifier);
+
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(window) = weak_for_thread.upgrade() {
+                        window.set_is_logging_in(false);
+                        match result {
+                            Ok(crate::auth::SsoTokenResult::NeedsMasterPassword {
+                                access_token,
+                                protected_user_key,
+                                api_base_url,
+                                kdf_config,
+                                client,
+                            }) => {
+                                if let Ok(mut pending) = sso_pending.lock() {
+                                    *pending = Some(SsoPendingState {
+                                        access_token,
+                                        protected_user_key,
+                                        api_base_url,
+                                        kdf_config,
+                                        client,
+                                        email: email.clone(),
+                                    });
+                                }
+                                window.set_status_is_error(false);
+                                window.set_status_text("".into());
+                                window.set_is_sso_awaiting_password(true);
+                                window.set_sso_master_password("".into());
+                            }
+                            Ok(crate::auth::SsoTokenResult::NoDecryptionPath { message }) => {
+                                window.set_status_is_error(true);
+                                window.set_status_text(message.into());
+                            }
+                            Err(error) => {
+                                window.set_status_is_error(true);
+                                window.set_status_text(error.into());
+                            }
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    {
+        let weak_window = weak_window.clone();
+        let sso_pending_state = sso_pending_state.clone();
+        let tree_state = tree_state.clone();
+        let vault_item_state = vault_item_state.clone();
+        let visible_item_indices_state = visible_item_indices_state.clone();
+        let password_visible_state = password_visible_state.clone();
+
+        window.on_sso_master_password_submitted(move || {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+
+            if window.get_is_logging_in() {
+                return;
+            }
+
+            let master_password = window.get_sso_master_password().to_string();
+            if master_password.trim().is_empty() {
+                window.set_status_is_error(true);
+                window.set_status_text("Master password is required.".into());
+                return;
+            }
+
+            let pending = {
+                let Ok(mut pending_ref) = sso_pending_state.lock() else {
+                    return;
+                };
+                pending_ref.take()
+            };
+
+            let Some(pending) = pending else {
+                window.set_status_is_error(true);
+                window.set_status_text("SSO session expired. Please try again.".into());
+                window.set_is_sso_awaiting_password(false);
+                return;
+            };
+
+            window.set_status_is_error(false);
+            window.set_status_text("Decrypting vault...".into());
+            window.set_is_logging_in(true);
+            window.set_search_query("".into());
+            window.set_has_active_search(false);
+
+            let weak_for_thread = weak_window.clone();
+            let tree_state = tree_state.clone();
+            let vault_item_state = vault_item_state.clone();
+            let visible_item_indices = visible_item_indices_state.clone();
+            let password_visible_state = password_visible_state.clone();
+            thread::spawn(move || {
+                let result = crate::auth::complete_sso_with_master_password(
+                    &pending.client,
+                    &pending.api_base_url,
+                    &pending.access_token,
+                    &pending.protected_user_key,
+                    &master_password,
+                    &pending.email,
+                    &pending.kdf_config,
+                );
+
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(window) = weak_for_thread.upgrade() {
+                        window.set_is_logging_in(false);
+                        match result {
+                            Ok(result) => {
+                                window.set_status_is_error(false);
+                                window.set_status_text(
+                                    format!(
+                                        "SSO login successful. Loaded {} collections and {} items.",
+                                        result.collections.len(),
+                                        result.items.len()
+                                    )
+                                    .into(),
+                                );
+                                window.set_sso_master_password("".into());
+                                window.set_is_sso_awaiting_password(false);
+
+                                let collection_state =
+                                    CollectionTreeState::from_paths(&result.collections);
+                                window.set_collection_tree_rows(collection_state.to_model());
+
+                                let item_rows: Vec<VaultItemUiState> = result
+                                    .items
+                                    .into_iter()
+                                    .map(|item| VaultItemUiState {
+                                        label: item.label,
+                                        fields: item
+                                            .fields
+                                            .into_iter()
+                                            .map(|field| (field.label, field.value))
+                                            .collect(),
+                                    })
+                                    .collect();
+
+                                let visible_indices: Vec<usize> = (0..item_rows.len()).collect();
+                                window.set_vault_item_rows(model_from_item_rows(
+                                    &item_rows,
+                                    &visible_indices,
+                                ));
+
+                                if item_rows.is_empty() {
+                                    window.set_selected_vault_item_index(-1);
+                                    window.set_selected_vault_item_title("".into());
+                                    window.set_selected_vault_item_fields(ModelRc::new(
+                                        VecModel::<crate::VaultItemFieldRow>::default(),
+                                    ));
+                                    window.set_selected_vault_item_empty_text(
+                                        "No vault items loaded.".into(),
+                                    );
+                                    window.set_selected_has_password(false);
+                                    window.set_is_password_visible(false);
+                                } else {
+                                    if let Ok(mut visible_state) = password_visible_state.lock() {
+                                        *visible_state = false;
+                                        apply_selected_item(
+                                            &window,
+                                            0,
+                                            &item_rows[0],
+                                            *visible_state,
+                                        );
+                                    } else {
+                                        apply_selected_item(&window, 0, &item_rows[0], false);
+                                    }
+                                }
+
+                                if let Ok(mut state) = tree_state.lock() {
+                                    *state = Some(collection_state);
+                                }
+                                if let Ok(mut items) = vault_item_state.lock() {
+                                    *items = item_rows;
+                                }
+                                if let Ok(mut visible_ref) = visible_item_indices.lock() {
+                                    *visible_ref = visible_indices;
+                                }
+                                window.set_is_vault_view(true);
+                            }
+                            Err(error) => {
+                                // Put the pending state back so the user can retry
+                                // (we already consumed it with take())
+                                window.set_status_is_error(true);
+                                window.set_status_text(error.into());
+                            }
+                        }
+                    }
+                });
+            });
+        });
+    }
 
     schedule_totp_refresh(
         weak_window.clone(),
