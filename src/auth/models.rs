@@ -20,7 +20,10 @@ pub(super) struct PreloginRequest<'a> {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct TokenSuccessResponse {
+    #[serde(alias = "accessToken")]
     pub(super) access_token: Option<String>,
+    #[serde(alias = "Key")]
+    pub(super) key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

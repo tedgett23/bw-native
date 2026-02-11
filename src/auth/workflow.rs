@@ -7,7 +7,8 @@ use uuid::Uuid;
 use super::crypto::{derive_master_key, derive_password_hash, kdf_config_from_prelogin};
 use super::errors::extract_error_message;
 use super::models::{PreloginRequest, PreloginResponse, TokenSuccessResponse};
-use super::server::{normalize_email, resolve_identity_base_url};
+use super::server::{normalize_email, resolve_api_base_url, resolve_identity_base_url};
+use super::vault::sync_and_print_vault;
 
 pub fn try_login(server_url: &str, username: &str, password: &str) -> Result<(), String> {
     let server_url = server_url.trim();
@@ -26,6 +27,7 @@ pub fn try_login(server_url: &str, username: &str, password: &str) -> Result<(),
 
     let normalized_email = normalize_email(username);
     let identity_base_url = resolve_identity_base_url(server_url)?;
+    let api_base_url = resolve_api_base_url(server_url)?;
 
     let client = Client::builder()
         .timeout(Duration::from_secs(25))
@@ -81,17 +83,39 @@ pub fn try_login(server_url: &str, username: &str, password: &str) -> Result<(),
     let status = token_response.status();
     let body = token_response.text().unwrap_or_default();
 
-    if status.is_success() {
-        let success: TokenSuccessResponse =
-            from_str(&body).map_err(|error| format!("Invalid token response: {error}"))?;
-        if success.access_token.is_some() {
-            return Ok(());
-        }
-        return Err("Login response did not include an access token.".to_string());
+    println!("===== Token Response ({status}) =====");
+    println!("{body}");
+    println!("===== End Token Response =====");
+
+    if !status.is_success() {
+        return Err(format!(
+            "Login failed ({status}): {}",
+            extract_error_message(&body)
+        ));
     }
 
-    Err(format!(
-        "Login failed ({status}): {}",
-        extract_error_message(&body)
-    ))
+    let success: TokenSuccessResponse =
+        from_str(&body).map_err(|error| format!("Invalid token response: {error}"))?;
+
+    let access_token = success
+        .access_token
+        .ok_or_else(|| "Login response did not include an access token.".to_string())?;
+    let protected_user_key = success
+        .key
+        .ok_or_else(|| "Login response did not include the encrypted user key.".to_string())?;
+
+    println!(
+        "Token parse summary: access_token_present=true key_present=true key_len={}",
+        protected_user_key.len()
+    );
+
+    sync_and_print_vault(
+        &client,
+        &api_base_url,
+        &access_token,
+        &master_key,
+        &protected_user_key,
+    )?;
+
+    Ok(())
 }
