@@ -399,23 +399,30 @@ fn decrypt_uris(login: &mut Value, key: &SymmetricKey) {
 }
 
 fn decrypt_cipher_data(cipher: &mut Value, key: &SymmetricKey) {
-    let data_string = cipher
-        .get("data")
-        .and_then(Value::as_str)
-        .map(|value| value.to_string());
-
-    let Some(data_string) = data_string else {
+    let Some(data_slot) = cipher.get_mut("data") else {
         return;
     };
 
-    let Ok(mut data_json) = serde_json::from_str::<Value>(&data_string) else {
-        return;
-    };
+    match data_slot {
+        Value::Object(_) | Value::Array(_) => {
+            decrypt_json_value(data_slot, key);
+        }
+        Value::String(raw_data) => {
+            let mut parse_candidate = raw_data.clone();
 
-    decrypt_json_value(&mut data_json, key);
+            // Some servers return `data` as an encrypted JSON blob.
+            if let Ok(decrypted_data) = decrypt_ciphertext_string(raw_data, key) {
+                parse_candidate = decrypted_data;
+            }
 
-    if let Some(data_slot) = cipher.get_mut("data") {
-        *data_slot = data_json;
+            let Ok(mut data_json) = serde_json::from_str::<Value>(&parse_candidate) else {
+                return;
+            };
+
+            decrypt_json_value(&mut data_json, key);
+            *data_slot = data_json;
+        }
+        _ => {}
     }
 }
 
@@ -860,7 +867,35 @@ fn is_name_label(label: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecryptedVaultField, order_item_fields, prettify_segment};
+    use base64::Engine as _;
+    use cbc::cipher::block_padding::Pkcs7;
+    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+    use serde_json::json;
+
+    use super::{
+        Aes256, BASE64_STANDARD, DecryptedVaultField, SymmetricKey, decrypt_cipher_data,
+        order_item_fields, prettify_segment,
+    };
+
+    fn encrypt_type0(plaintext: &str, key: &SymmetricKey) -> String {
+        let iv = [7_u8; 16];
+        let mut buffer = plaintext.as_bytes().to_vec();
+        let message_len = buffer.len();
+        buffer.resize(message_len + 16, 0);
+
+        let encryptor = cbc::Encryptor::<Aes256>::new_from_slices(&key.enc, &iv)
+            .expect("test key and iv should be valid lengths");
+        let ciphertext = encryptor
+            .encrypt_padded_mut::<Pkcs7>(&mut buffer, message_len)
+            .expect("test plaintext should encrypt")
+            .to_vec();
+
+        format!(
+            "0.{}|{}",
+            BASE64_STANDARD.encode(iv),
+            BASE64_STANDARD.encode(ciphertext)
+        )
+    }
 
     #[test]
     fn prettifies_common_data_keys() {
@@ -904,5 +939,38 @@ mod tests {
         assert!(super::is_name_label("Name"));
         assert!(super::is_name_label("Login / Name"));
         assert!(!super::is_name_label("Username"));
+    }
+
+    #[test]
+    fn decrypts_vaultwarden_object_data_fields() {
+        let key = SymmetricKey::from_slice(&[11_u8; 32]).expect("valid 32-byte key");
+        let encrypted_username = encrypt_type0("alice@example.com", &key);
+        let encrypted_password = encrypt_type0("super-secret", &key);
+
+        let mut cipher = json!({
+            "data": {
+                "username": encrypted_username,
+                "password": encrypted_password
+            }
+        });
+
+        decrypt_cipher_data(&mut cipher, &key);
+
+        assert_eq!(cipher["data"]["username"], "alice@example.com");
+        assert_eq!(cipher["data"]["password"], "super-secret");
+    }
+
+    #[test]
+    fn decrypts_encrypted_json_data_blob() {
+        let key = SymmetricKey::from_slice(&[13_u8; 32]).expect("valid 32-byte key");
+        let encrypted_blob = encrypt_type0(r#"{"username":"alice"}"#, &key);
+
+        let mut cipher = json!({
+            "data": encrypted_blob
+        });
+
+        decrypt_cipher_data(&mut cipher, &key);
+
+        assert_eq!(cipher["data"]["username"], "alice");
     }
 }
