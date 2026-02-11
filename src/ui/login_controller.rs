@@ -14,9 +14,13 @@ struct VaultItemUiState {
     fields: Vec<(String, String)>,
 }
 
-fn model_from_item_rows(items: &[VaultItemUiState]) -> ModelRc<crate::VaultItemRow> {
-    let rows: Vec<crate::VaultItemRow> = items
+fn model_from_item_rows(
+    items: &[VaultItemUiState],
+    visible_indices: &[usize],
+) -> ModelRc<crate::VaultItemRow> {
+    let rows: Vec<crate::VaultItemRow> = visible_indices
         .iter()
+        .filter_map(|index| items.get(*index))
         .map(|item| crate::VaultItemRow {
             label: SharedString::from(&item.label),
         })
@@ -56,6 +60,33 @@ fn is_totp_label(label: &str) -> bool {
 
 fn has_password_field(fields: &[(String, String)]) -> bool {
     fields.iter().any(|(label, _)| is_password_label(label))
+}
+
+fn build_visible_item_indices(items: &[VaultItemUiState], raw_query: &str) -> Vec<usize> {
+    let query = raw_query.trim().to_lowercase();
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| item_matches_query(item, &query).then_some(index))
+        .collect()
+}
+
+fn item_matches_query(item: &VaultItemUiState, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+
+    if item.label.to_lowercase().contains(query) {
+        return true;
+    }
+
+    item.fields.iter().any(|(label, value)| {
+        if is_password_label(label) || is_totp_label(label) {
+            return false;
+        }
+
+        label.to_lowercase().contains(query) || value.to_lowercase().contains(query)
+    })
 }
 
 fn to_totp_code(raw_value: &str) -> Option<String> {
@@ -430,6 +461,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
     let weak_window = window.as_weak();
     let tree_state = Arc::new(Mutex::new(None::<CollectionTreeState>));
     let vault_item_state = Arc::new(Mutex::new(Vec::<VaultItemUiState>::new()));
+    let visible_item_indices_state = Arc::new(Mutex::new(Vec::<usize>::new()));
     let password_visible_state = Arc::new(Mutex::new(false));
 
     {
@@ -460,6 +492,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
     {
         let weak_window = weak_window.clone();
         let vault_item_state = vault_item_state.clone();
+        let visible_item_indices_state = visible_item_indices_state.clone();
         let password_visible_state = password_visible_state.clone();
 
         window.on_vault_item_clicked(move |row_index| {
@@ -471,31 +504,37 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                 return;
             };
 
+            let source_index = {
+                let Ok(visible_indices_ref) = visible_item_indices_state.lock() else {
+                    return;
+                };
+                let Some(source_index) = visible_indices_ref.get(row_index).copied() else {
+                    return;
+                };
+                source_index
+            };
+
             let Ok(items_ref) = vault_item_state.lock() else {
                 return;
             };
-            let Some(item) = items_ref.get(row_index) else {
+            let Some(item) = items_ref.get(source_index) else {
                 return;
             };
 
-            let mut is_password_visible = false;
             if let Ok(mut visible_state) = password_visible_state.lock() {
                 *visible_state = false;
             } else {
                 return;
             }
 
-            if let Ok(visible_state) = password_visible_state.lock() {
-                is_password_visible = *visible_state;
-            }
-
-            apply_selected_item(&window, row_index, item, is_password_visible);
+            apply_selected_item(&window, row_index, item, false);
         });
     }
 
     {
         let weak_window = weak_window.clone();
         let vault_item_state = vault_item_state.clone();
+        let visible_item_indices_state = visible_item_indices_state.clone();
         let password_visible_state = password_visible_state.clone();
 
         window.on_toggle_password_visibility(move || {
@@ -508,10 +547,20 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                 return;
             };
 
+            let source_index = {
+                let Ok(visible_indices_ref) = visible_item_indices_state.lock() else {
+                    return;
+                };
+                let Some(source_index) = visible_indices_ref.get(selected_index).copied() else {
+                    return;
+                };
+                source_index
+            };
+
             let Ok(items_ref) = vault_item_state.lock() else {
                 return;
             };
-            let Some(item) = items_ref.get(selected_index) else {
+            let Some(item) = items_ref.get(source_index) else {
                 return;
             };
 
@@ -527,9 +576,86 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         });
     }
 
+    {
+        let weak_window = weak_window.clone();
+        let vault_item_state = vault_item_state.clone();
+        let visible_item_indices_state = visible_item_indices_state.clone();
+        let password_visible_state = password_visible_state.clone();
+
+        window.on_search_requested(move || {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+
+            let search_query = window.get_search_query().to_string();
+            let has_active_search = !search_query.trim().is_empty();
+            window.set_has_active_search(has_active_search);
+
+            let selected_source_index = {
+                let selected_visible_index =
+                    usize::try_from(window.get_selected_vault_item_index()).ok();
+                let Ok(visible_indices_ref) = visible_item_indices_state.lock() else {
+                    return;
+                };
+
+                selected_visible_index.and_then(|index| visible_indices_ref.get(index).copied())
+            };
+
+            let Ok(items_ref) = vault_item_state.lock() else {
+                return;
+            };
+
+            let next_visible_indices = build_visible_item_indices(&items_ref, &search_query);
+            window.set_vault_item_rows(model_from_item_rows(&items_ref, &next_visible_indices));
+
+            if let Ok(mut visible_indices_ref) = visible_item_indices_state.lock() {
+                *visible_indices_ref = next_visible_indices.clone();
+            } else {
+                return;
+            }
+
+            if let Ok(mut visible_state) = password_visible_state.lock() {
+                *visible_state = false;
+            }
+            window.set_is_password_visible(false);
+
+            if next_visible_indices.is_empty() {
+                window.set_selected_vault_item_index(-1);
+                window.set_selected_vault_item_title("".into());
+                window.set_selected_vault_item_fields(ModelRc::new(VecModel::<
+                    crate::VaultItemFieldRow,
+                >::default()));
+                window.set_selected_vault_item_empty_text(
+                    if has_active_search {
+                        "No vault items match your search."
+                    } else {
+                        "No vault items loaded."
+                    }
+                    .into(),
+                );
+                window.set_selected_has_password(false);
+                return;
+            }
+
+            let selected_visible_index = selected_source_index
+                .and_then(|source_index| {
+                    next_visible_indices
+                        .iter()
+                        .position(|visible_source_index| *visible_source_index == source_index)
+                })
+                .unwrap_or(0);
+
+            let source_index = next_visible_indices[selected_visible_index];
+            if let Some(item) = items_ref.get(source_index) {
+                apply_selected_item(&window, selected_visible_index, item, false);
+            }
+        });
+    }
+
     let weak_window_for_login = weak_window.clone();
     let tree_state_for_login = tree_state.clone();
     let vault_item_state_for_login = vault_item_state.clone();
+    let visible_item_indices_for_login = visible_item_indices_state.clone();
     let password_visible_state_for_login = password_visible_state.clone();
     window.on_login_requested(move || {
         let Some(window) = weak_window_for_login.upgrade() else {
@@ -548,6 +674,8 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         window.set_status_text("Logging in...".into());
         window.set_is_logging_in(true);
         window.set_is_vault_view(false);
+        window.set_search_query("".into());
+        window.set_has_active_search(false);
         window.set_collection_tree_rows(ModelRc::new(
             VecModel::<crate::CollectionTreeRow>::default(),
         ));
@@ -566,6 +694,9 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         if let Ok(mut items) = vault_item_state_for_login.lock() {
             items.clear();
         }
+        if let Ok(mut visible_indices) = visible_item_indices_for_login.lock() {
+            visible_indices.clear();
+        }
         if let Ok(mut visible_state) = password_visible_state_for_login.lock() {
             *visible_state = false;
         }
@@ -573,6 +704,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         let weak_for_thread = weak_window_for_login.clone();
         let tree_state = tree_state_for_login.clone();
         let vault_item_state = vault_item_state_for_login.clone();
+        let visible_item_indices = visible_item_indices_for_login.clone();
         let password_visible_state = password_visible_state_for_login.clone();
         thread::spawn(move || {
             let result = crate::auth::try_login(&server_url, &username, &password);
@@ -607,7 +739,11 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                                         .collect(),
                                 })
                                 .collect();
-                            window.set_vault_item_rows(model_from_item_rows(&item_rows));
+                            let visible_indices: Vec<usize> = (0..item_rows.len()).collect();
+                            window.set_vault_item_rows(model_from_item_rows(
+                                &item_rows,
+                                &visible_indices,
+                            ));
                             if item_rows.is_empty() {
                                 window.set_selected_vault_item_index(-1);
                                 window.set_selected_vault_item_title("".into());
@@ -634,6 +770,9 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                             if let Ok(mut items) = vault_item_state.lock() {
                                 *items = item_rows;
                             }
+                            if let Ok(mut visible_ref) = visible_item_indices.lock() {
+                                *visible_ref = visible_indices;
+                            }
                             window.set_is_vault_view(true);
                         }
                         Err(error) => {
@@ -649,6 +788,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
     schedule_totp_refresh(
         weak_window.clone(),
         vault_item_state.clone(),
+        visible_item_indices_state.clone(),
         password_visible_state.clone(),
     );
 }
@@ -656,31 +796,50 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
 fn schedule_totp_refresh(
     weak_window: slint::Weak<crate::MainWindow>,
     vault_item_state: Arc<Mutex<Vec<VaultItemUiState>>>,
+    visible_item_indices_state: Arc<Mutex<Vec<usize>>>,
     password_visible_state: Arc<Mutex<bool>>,
 ) {
     slint::Timer::single_shot(Duration::from_secs(1), move || {
         if let Some(window) = weak_window.upgrade() {
             let selected_index = window.get_selected_vault_item_index();
             if let Ok(selected_index) = usize::try_from(selected_index) {
-                if let Ok(items_ref) = vault_item_state.lock() {
-                    if let Some(item) = items_ref.get(selected_index) {
-                        let is_password_visible = password_visible_state
-                            .lock()
-                            .map(|state| *state)
-                            .unwrap_or(false);
-                        apply_selected_item(&window, selected_index, item, is_password_visible);
+                let source_index =
+                    visible_item_indices_state
+                        .lock()
+                        .ok()
+                        .and_then(|visible_indices_ref| {
+                            visible_indices_ref.get(selected_index).copied()
+                        });
+
+                if let Some(source_index) = source_index {
+                    if let Ok(items_ref) = vault_item_state.lock() {
+                        if let Some(item) = items_ref.get(source_index) {
+                            let is_password_visible = password_visible_state
+                                .lock()
+                                .map(|state| *state)
+                                .unwrap_or(false);
+                            apply_selected_item(&window, selected_index, item, is_password_visible);
+                        }
                     }
                 }
             }
         }
 
-        schedule_totp_refresh(weak_window, vault_item_state, password_visible_state);
+        schedule_totp_refresh(
+            weak_window,
+            vault_item_state,
+            visible_item_indices_state,
+            password_visible_state,
+        );
     });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_base32_secret, generate_totp_code, parse_totp_config};
+    use super::{
+        VaultItemUiState, build_visible_item_indices, decode_base32_secret, generate_totp_code,
+        parse_totp_config,
+    };
 
     #[test]
     fn generates_known_totp_vector_sha1() {
@@ -700,5 +859,42 @@ mod tests {
         assert_eq!(config.period, 30);
         assert_eq!(config.algorithm, "SHA1");
         assert!(!config.secret.is_empty());
+    }
+
+    #[test]
+    fn search_matches_non_sensitive_fields_only() {
+        let items = vec![
+            VaultItemUiState {
+                label: "Example".to_string(),
+                fields: vec![
+                    (
+                        "Login / Username".to_string(),
+                        "alice@example.com".to_string(),
+                    ),
+                    (
+                        "Login / Password".to_string(),
+                        "secret-password".to_string(),
+                    ),
+                    ("Login / Totp".to_string(), "JBSWY3DPEHPK3PXP".to_string()),
+                    ("Login / Notes".to_string(), "prod account".to_string()),
+                ],
+            },
+            VaultItemUiState {
+                label: "Dev".to_string(),
+                fields: vec![("Custom / Team".to_string(), "platform".to_string())],
+            },
+        ];
+
+        assert_eq!(build_visible_item_indices(&items, "alice"), vec![0]);
+        assert_eq!(build_visible_item_indices(&items, "prod"), vec![0]);
+        assert_eq!(build_visible_item_indices(&items, "platform"), vec![1]);
+        assert_eq!(
+            build_visible_item_indices(&items, "secret-password"),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            build_visible_item_indices(&items, "JBSWY3DPEHPK3PXP"),
+            Vec::<usize>::new()
+        );
     }
 }

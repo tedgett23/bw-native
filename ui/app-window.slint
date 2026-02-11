@@ -50,6 +50,8 @@ export component MainWindow inherits Window {
     in-out property <bool> is-vault-view;
     in-out property <[CollectionTreeRow]> collection-tree-rows;
     in-out property <[VaultItemRow]> vault-item-rows;
+    in-out property <string> search-query;
+    in-out property <bool> has-active-search;
     in-out property <int> selected-vault-item-index: -1;
     in-out property <string> selected-vault-item-title;
     in-out property <[VaultItemFieldRow]> selected-vault-item-fields;
@@ -58,6 +60,7 @@ export component MainWindow inherits Window {
     in-out property <bool> is-password-visible;
     callback collection-tree-row-clicked(int);
     callback vault-item-clicked(int);
+    callback search-requested();
     callback toggle-password-visibility();
 
     Rectangle {
@@ -251,7 +254,7 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle {
-                        width: 200px;
+                        width: 300px;
                         background: root.color-bg-elevated;
                         border-width: 1px;
                         border-color: root.color-border;
@@ -269,6 +272,23 @@ export component MainWindow inherits Window {
                                 color: root.color-text-primary;
                                 font-size: 14px;
                                 font-weight: 700;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 6px;
+
+                                LineEdit {
+                                    horizontal-stretch: 1;
+                                    text <=> root.search-query;
+                                    placeholder-text: "Search item names and fields";
+                                }
+
+                                Button {
+                                    text: "Search";
+                                    clicked => {
+                                        root.search-requested();
+                                    }
+                                }
                             }
 
                             ListView {
@@ -294,7 +314,7 @@ export component MainWindow inherits Window {
                             }
 
                             Text {
-                                text: root.vault-item-rows.length > 0 ? "" : "No vault items loaded.";
+                                text: root.vault-item-rows.length > 0 ? "" : (root.has-active-search ? "No vault items match your search." : "No vault items loaded.");
                                 color: root.color-text-muted;
                                 font-size: 12px;
                             }
