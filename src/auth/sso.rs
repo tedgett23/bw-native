@@ -13,7 +13,9 @@ use uuid::Uuid;
 use super::crypto::{derive_master_key, kdf_config_from_prelogin};
 use super::errors::extract_error_message;
 use super::models::{PreloginResponse, SsoPreValidateResponse, TokenSuccessResponse};
-use super::server::{normalize_email, resolve_api_base_url, resolve_identity_base_url};
+use super::server::{
+    normalize_email, resolve_api_base_url, resolve_identity_base_url, resolve_web_vault_url,
+};
 use super::vault::sync_and_decrypt_vault;
 use super::workflow::{LoginResult, VaultItemFieldView, VaultItemView};
 
@@ -73,6 +75,7 @@ pub fn try_sso_login(server_url: &str, org_identifier: &str) -> Result<SsoTokenR
 
     let identity_base_url = resolve_identity_base_url(server_url)?;
     let api_base_url = resolve_api_base_url(server_url)?;
+    let web_vault_url = resolve_web_vault_url(server_url)?;
 
     let client = Client::builder()
         .timeout(Duration::from_secs(25))
@@ -82,7 +85,7 @@ pub fn try_sso_login(server_url: &str, org_identifier: &str) -> Result<SsoTokenR
         .map_err(|error| format!("Failed to create HTTP client: {error}"))?;
 
     // Step 1: Prevalidate SSO
-    let sso_token = prevalidate_sso(&client, &identity_base_url, org_identifier)?;
+    let _sso_token = prevalidate_sso(&client, &identity_base_url, org_identifier)?;
 
     // Step 2: Generate PKCE parameters
     let code_verifier = generate_random_string(64);
@@ -98,14 +101,14 @@ pub fn try_sso_login(server_url: &str, org_identifier: &str) -> Result<SsoTokenR
 
     let redirect_uri = format!("http://localhost:{port}");
 
-    // Step 4: Build authorize URL and open browser
+    // Step 4: Build SSO URL through the web vault (the web vault handles the
+    // actual OAuth/OIDC flow with the identity server)
     let authorize_url = build_authorize_url(
-        &identity_base_url,
+        &web_vault_url,
         &redirect_uri,
         &state,
         &code_challenge,
         org_identifier,
-        &sso_token,
     );
 
     open_browser(&authorize_url)?;
@@ -297,30 +300,24 @@ fn generate_code_challenge(code_verifier: &str) -> String {
 }
 
 fn build_authorize_url(
-    identity_base_url: &str,
+    web_vault_url: &str,
     redirect_uri: &str,
     state: &str,
     code_challenge: &str,
     org_identifier: &str,
-    sso_token: &str,
 ) -> String {
     format!(
-        "{identity_base_url}/connect/authorize?\
-         client_id=desktop\
-         &redirect_uri={}\
-         &response_type=code\
-         &scope=api%20offline_access\
+        "{}/#/sso?\
+         clientId=desktop\
+         &redirectUri={}\
          &state={}\
-         &code_challenge={}\
-         &code_challenge_method=S256\
-         &response_mode=query\
-         &domain_hint={}\
-         &ssoToken={}",
+         &codeChallenge={}\
+         &identifier={}",
+        web_vault_url.trim_end_matches('/'),
         urlencoded(redirect_uri),
         urlencoded(state),
         urlencoded(code_challenge),
         urlencoded(org_identifier),
-        urlencoded(sso_token),
     )
 }
 
@@ -502,9 +499,15 @@ fn open_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     let result = std::process::Command::new("xdg-open").arg(url).status();
 
+    // On Windows, we must use PowerShell's Start-Process because cmd.exe's
+    // `start` command interprets `&` in URLs as command separators.
     #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
+    let result = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("Start-Process '{}'", url.replace('\'', "''")),
+        ])
         .status();
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
