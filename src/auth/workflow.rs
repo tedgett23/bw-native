@@ -47,6 +47,7 @@ pub fn try_login(server_url: &str, username: &str, password: &str) -> Result<Log
     let client = Client::builder()
         .timeout(Duration::from_secs(25))
         .user_agent("bw-native/0.1.0")
+        .danger_accept_invalid_certs(true)
         .build()
         .map_err(|error| format!("Failed to create HTTP client: {error}"))?;
 
