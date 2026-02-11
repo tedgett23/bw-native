@@ -24,13 +24,23 @@ Completed:
 - Vault view now has three horizontal sections:
   - Left: collections tree
   - Middle: vault items list
-  - Right: empty placeholder panel for details
+  - Right: read-only selected-item details form
 - Collections are grouped into a collapsible tree (expand/collapse on click), built from slash-separated collection paths.
+- Vault item selection implemented:
+  - Clicking an item in the middle list updates the right-hand details panel.
+  - Selected item is highlighted in the middle list.
+- Vault details panel implemented:
+  - Renders non-empty decrypted fields from `cipher.data` as structured label/value rows.
+  - Field order is prioritized as Username, Password, TOTP, then other fields.
+  - `Name` is removed from field rows and shown only as the panel title.
+  - Password row supports reveal/hide toggle.
+  - TOTP row renders rolling code from stored seed (raw Base32 or `otpauth://` URI).
+  - TOTP display refreshes automatically on a 1-second timer.
 
 Not completed:
 - Dedicated 2FA challenge UI flow.
 - Session/token persistence after successful login.
-- Vault item details panel behavior (click item in middle list -> render full item contents in right section).
+- Dark mode and visual polish pass for the interface.
 
 # Changes Made
 - `ui/app-window.slint`
@@ -42,14 +52,24 @@ Not completed:
     - `is-vault-view`
   - Added vault models:
     - `collection-tree-rows`
-    - `vault-items`
+    - `vault-item-rows`
+    - `selected-vault-item-fields`
   - Added callback:
     - `collection-tree-row-clicked(int)`
+    - `vault-item-clicked(int)`
+    - `toggle-password-visibility()`
   - Added `CollectionTreeRow` struct for tree row rendering metadata.
+  - Added `VaultItemRow` and `VaultItemFieldRow` structs.
   - Added vault layout with 3 horizontal sections:
     - fixed-width left collections section
     - fixed-width middle vault items section
-    - flexible empty right section
+    - flexible right details section with read-only form cards
+  - Added selected item state properties:
+    - `selected-vault-item-index`
+    - `selected-vault-item-title`
+    - `selected-vault-item-empty-text`
+    - `selected-has-password`
+    - `is-password-visible`
 - `src/main.rs`
   - Reduced to entrypoint only (`ui::run()`), module declarations, and Slint include.
 - `src/ui/mod.rs`
@@ -64,6 +84,12 @@ Not completed:
     - path-to-tree build
     - flattened visible rows
     - expand/collapse toggle handling
+  - Added selected vault item state management and click handling.
+  - Added password masking/reveal behavior for password field rows.
+  - Added TOTP generation and live refresh pipeline:
+    - Parses raw Base32 secrets and `otpauth://` URIs.
+    - Supports SHA1/SHA256/SHA512, configurable digits/period from URI.
+    - Computes rolling codes and updates selected row values every second.
 - `src/auth/mod.rs`
   - Auth module root; re-exports `try_login`.
 - `src/auth/workflow.rs`
@@ -75,7 +101,7 @@ Not completed:
     - `/connect/token` request
     - post-login `/sync` + decrypt call
     - success/error handling
-  - Returns structured login result with decrypted collection and item summary lists for UI.
+  - Returns structured login result with decrypted collection list + structured item field data for UI.
 - `src/auth/crypto.rs`
   - KDF config parsing from prelogin response.
   - PBKDF2 and Argon2id key derivation.
@@ -99,8 +125,15 @@ Not completed:
     - decrypt collections/folders names
   - Added `DecryptedVaultView` output with:
     - `collections: Vec<String>`
-    - `items: Vec<String>`
-  - Added summary extraction helpers for collection names and vault item labels.
+    - `items: Vec<DecryptedVaultItem>`
+  - Added `DecryptedVaultItem` and `DecryptedVaultField` for structured details output.
+  - Added extraction helpers for:
+    - collection names
+    - item names for list labels
+    - non-empty decrypted `cipher.data` fields for details rendering
+  - Added field-label prettification and deterministic field ordering.
+  - Added filter to omit `Name` from details fields.
+  - Added unit tests for label formatting and ordering/filter behavior.
 - `Cargo.toml`
   - Added deps for auth/network/crypto/decrypt:
     - `reqwest` (blocking/json/rustls-tls)
@@ -117,10 +150,14 @@ Not completed:
 - Added organization decryption support using decrypted profile private key for asymmetric key material.
 - Chose a single window with conditional views rather than opening a second window instance, to preserve size/position during login -> vault transition.
 - Implemented collection navigation as a client-side tree model derived from collection path segments.
+- Chose structured details models (field rows) instead of raw JSON text rendering for right-hand item details.
+- Defaulted password to masked display with explicit reveal toggle.
+- Implemented TOTP computation client-side from decrypted seed values so the UI shows live codes instead of raw secrets.
 
 # Validation Run
 Commands executed:
 - `cargo check`
+- `cargo test --quiet`
 
 Result:
 - Passed after UI/login implementation.
@@ -129,11 +166,12 @@ Result:
 - Passed after introducing vault rendering models and list binding.
 - Passed after converting to single-window multi-view layout.
 - Passed after adding collapsible collection tree state and callbacks.
+- Passed after adding selectable details form panel.
+- Passed after adding password reveal toggle and field ordering.
+- Passed after adding rolling TOTP rendering and tests.
 
 # Remaining Work
-1. Implement vault item selection behavior:
-   - click a vault item in the middle section
-   - render full decrypted vault item contents in the far-right section
+1. Implement dark mode and polish the visual design of login + vault views (colors, spacing, typography, and component styling consistency).
 2. Add 2FA flow (provider selection + code input + retry token request with 2FA params).
 3. Persist server URL and username between launches.
 4. Store access/refresh token securely and wire post-login app flow.
@@ -144,6 +182,7 @@ Result:
    - `resolve_api_base_url`
    - KDF selection + derivation paths
    - error message parsing
+   - TOTP edge cases (invalid seeds, URI variants, non-30-second periods)
 
 # Known Risks / Edge Cases
 - Current flow does not provide an explicit 2FA prompt; users requiring 2FA will see server errors in status text.
@@ -151,4 +190,5 @@ Result:
 - API URL resolution for unusual self-hosted path setups may need adjustment.
 - KDF defaults are defensive but should ideally always match server-returned values.
 - Decryption currently targets observed field structures and may need expansion for additional vault object variants.
-- Vault item list currently shows summary labels only; detail projection and field formatting rules for the right-hand details panel are not implemented yet.
+- Some vault types may have sparse/non-standard `cipher.data` layouts, so details panel field coverage may need per-type tuning.
+- TOTP rendering assumes standard Base32/otpauth formats; malformed secrets currently fall back to raw value display.

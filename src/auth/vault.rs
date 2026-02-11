@@ -34,7 +34,17 @@ struct CipherString {
 
 pub(super) struct DecryptedVaultView {
     pub(super) collections: Vec<String>,
-    pub(super) items: Vec<String>,
+    pub(super) items: Vec<DecryptedVaultItem>,
+}
+
+pub(super) struct DecryptedVaultItem {
+    pub(super) label: String,
+    pub(super) fields: Vec<DecryptedVaultField>,
+}
+
+pub(super) struct DecryptedVaultField {
+    pub(super) label: String,
+    pub(super) value: String,
 }
 
 impl SymmetricKey {
@@ -677,7 +687,7 @@ fn build_collection_list(sync_json: &Value) -> Vec<String> {
         .collect()
 }
 
-fn build_item_list(sync_json: &Value) -> Vec<String> {
+fn build_item_list(sync_json: &Value) -> Vec<DecryptedVaultItem> {
     let Some(ciphers) = sync_json.get("ciphers").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -692,17 +702,207 @@ fn build_item_list(sync_json: &Value) -> Vec<String> {
                 .filter(|value| !value.is_empty())
                 .unwrap_or("Unnamed item");
 
-            let username = cipher
-                .get("login")
-                .and_then(|login| login.get("username"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-
-            match username {
-                Some(username) => format!("{name} ({username})"),
-                None => name.to_string(),
+            DecryptedVaultItem {
+                label: name.to_string(),
+                fields: build_item_fields(cipher),
             }
         })
         .collect()
+}
+
+fn build_item_fields(cipher: &Value) -> Vec<DecryptedVaultField> {
+    let Some(data) = cipher.get("data") else {
+        return Vec::new();
+    };
+
+    let mut fields = Vec::new();
+    collect_non_empty_data_fields(&[], data, &mut fields);
+    fields.retain(|field| !is_name_label(&field.label));
+    order_item_fields(&mut fields);
+    fields
+}
+
+fn collect_non_empty_data_fields(
+    path: &[String],
+    value: &Value,
+    out: &mut Vec<DecryptedVaultField>,
+) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let mut next_path = path.to_vec();
+                next_path.push(key.to_string());
+                collect_non_empty_data_fields(&next_path, child, out);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                let mut next_path = path.to_vec();
+                next_path.push(format!("#{}", index + 1));
+                collect_non_empty_data_fields(&next_path, child, out);
+            }
+        }
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                out.push(DecryptedVaultField {
+                    label: format_field_label(path),
+                    value: trimmed.to_string(),
+                });
+            }
+        }
+        Value::Number(number) => out.push(DecryptedVaultField {
+            label: format_field_label(path),
+            value: number.to_string(),
+        }),
+        Value::Bool(boolean) => out.push(DecryptedVaultField {
+            label: format_field_label(path),
+            value: boolean.to_string(),
+        }),
+        Value::Null => {}
+    }
+}
+
+fn format_field_label(path: &[String]) -> String {
+    if path.is_empty() {
+        return "Value".to_string();
+    }
+
+    let segments: Vec<String> = path
+        .iter()
+        .map(|segment| prettify_segment(segment))
+        .collect();
+    segments.join(" / ")
+}
+
+fn prettify_segment(segment: &str) -> String {
+    if segment.starts_with('#') {
+        return format!("Item {}", &segment[1..]);
+    }
+
+    let mut spaced = String::with_capacity(segment.len() + 8);
+    let mut previous_was_lower_or_digit = false;
+
+    for ch in segment.chars() {
+        if ch == '_' || ch == '-' || ch == '.' {
+            spaced.push(' ');
+            previous_was_lower_or_digit = false;
+            continue;
+        }
+
+        let is_upper = ch.is_uppercase();
+        if is_upper && previous_was_lower_or_digit {
+            spaced.push(' ');
+        }
+
+        spaced.push(ch);
+        previous_was_lower_or_digit = ch.is_lowercase() || ch.is_ascii_digit();
+    }
+
+    spaced
+        .split_whitespace()
+        .map(capitalize_word)
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+fn capitalize_word(word: &str) -> String {
+    let mut chars = word.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut output = String::new();
+    output.extend(first.to_uppercase());
+    output.push_str(chars.as_str());
+    output
+}
+
+fn order_item_fields(fields: &mut [DecryptedVaultField]) {
+    fields.sort_by_key(|field| (field_priority(&field.label), field.label.to_lowercase()));
+}
+
+fn field_priority(label: &str) -> u8 {
+    if is_username_label(label) {
+        0
+    } else if is_password_label(label) {
+        1
+    } else if is_totp_label(label) {
+        2
+    } else {
+        3
+    }
+}
+
+fn field_tail(label: &str) -> String {
+    label
+        .split('/')
+        .next_back()
+        .unwrap_or(label)
+        .trim()
+        .to_lowercase()
+}
+
+fn is_username_label(label: &str) -> bool {
+    field_tail(label) == "username"
+}
+
+fn is_password_label(label: &str) -> bool {
+    field_tail(label) == "password"
+}
+
+fn is_totp_label(label: &str) -> bool {
+    field_tail(label) == "totp" || field_tail(label) == "verification code"
+}
+
+fn is_name_label(label: &str) -> bool {
+    field_tail(label) == "name"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DecryptedVaultField, order_item_fields, prettify_segment};
+
+    #[test]
+    fn prettifies_common_data_keys() {
+        assert_eq!(prettify_segment("Password"), "Password");
+        assert_eq!(
+            prettify_segment("passwordRevisionDate"),
+            "Password Revision Date"
+        );
+        assert_eq!(prettify_segment("fido2_credentials"), "Fido2 Credentials");
+        assert_eq!(prettify_segment("#2"), "Item 2");
+    }
+
+    #[test]
+    fn orders_username_password_totp_first() {
+        let mut fields = vec![
+            DecryptedVaultField {
+                label: "Notes".to_string(),
+                value: "n".to_string(),
+            },
+            DecryptedVaultField {
+                label: "Password".to_string(),
+                value: "p".to_string(),
+            },
+            DecryptedVaultField {
+                label: "Totp".to_string(),
+                value: "t".to_string(),
+            },
+            DecryptedVaultField {
+                label: "Username".to_string(),
+                value: "u".to_string(),
+            },
+        ];
+
+        order_item_fields(&mut fields);
+        let labels: Vec<&str> = fields.iter().map(|field| field.label.as_str()).collect();
+        assert_eq!(labels, vec!["Username", "Password", "Totp", "Notes"]);
+    }
+
+    #[test]
+    fn detects_name_label_for_filtering() {
+        assert!(super::is_name_label("Name"));
+        assert!(super::is_name_label("Login / Name"));
+        assert!(!super::is_name_label("Username"));
+    }
 }

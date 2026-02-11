@@ -8,11 +8,21 @@ use super::crypto::{derive_master_key, derive_password_hash, kdf_config_from_pre
 use super::errors::extract_error_message;
 use super::models::{PreloginRequest, PreloginResponse, TokenSuccessResponse};
 use super::server::{normalize_email, resolve_api_base_url, resolve_identity_base_url};
-use super::vault::sync_and_decrypt_vault;
+use super::vault::{DecryptedVaultField, DecryptedVaultItem, sync_and_decrypt_vault};
 
 pub struct LoginResult {
     pub collections: Vec<String>,
-    pub items: Vec<String>,
+    pub items: Vec<VaultItemView>,
+}
+
+pub struct VaultItemView {
+    pub label: String,
+    pub fields: Vec<VaultItemFieldView>,
+}
+
+pub struct VaultItemFieldView {
+    pub label: String,
+    pub value: String,
 }
 
 pub fn try_login(server_url: &str, username: &str, password: &str) -> Result<LoginResult, String> {
@@ -115,6 +125,20 @@ pub fn try_login(server_url: &str, username: &str, password: &str) -> Result<Log
 
     Ok(LoginResult {
         collections: vault_view.collections,
-        items: vault_view.items,
+        items: vault_view.items.into_iter().map(map_item_view).collect(),
     })
+}
+
+fn map_item_view(item: DecryptedVaultItem) -> VaultItemView {
+    VaultItemView {
+        label: item.label,
+        fields: item.fields.into_iter().map(map_item_field_view).collect(),
+    }
+}
+
+fn map_item_field_view(field: DecryptedVaultField) -> VaultItemFieldView {
+    VaultItemFieldView {
+        label: field.label,
+        value: field.value,
+    }
 }

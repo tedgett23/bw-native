@@ -1,12 +1,319 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
+use sha2::{Sha256, Sha512};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
-fn model_from_strings(items: Vec<String>) -> ModelRc<SharedString> {
-    let rows: Vec<SharedString> = items.into_iter().map(SharedString::from).collect();
+#[derive(Clone, Default)]
+struct VaultItemUiState {
+    label: String,
+    fields: Vec<(String, String)>,
+}
+
+fn model_from_item_rows(items: &[VaultItemUiState]) -> ModelRc<crate::VaultItemRow> {
+    let rows: Vec<crate::VaultItemRow> = items
+        .iter()
+        .map(|item| crate::VaultItemRow {
+            label: SharedString::from(&item.label),
+        })
+        .collect();
     ModelRc::new(VecModel::from(rows))
+}
+
+fn model_from_item_fields(fields: &[(String, String)]) -> ModelRc<crate::VaultItemFieldRow> {
+    let rows: Vec<crate::VaultItemFieldRow> = fields
+        .iter()
+        .map(|(label, value)| crate::VaultItemFieldRow {
+            label: SharedString::from(label),
+            value: SharedString::from(value),
+        })
+        .collect();
+    ModelRc::new(VecModel::from(rows))
+}
+
+fn is_password_label(label: &str) -> bool {
+    label
+        .split('/')
+        .next_back()
+        .map(|tail| tail.trim().eq_ignore_ascii_case("password"))
+        .unwrap_or(false)
+}
+
+fn is_totp_label(label: &str) -> bool {
+    label
+        .split('/')
+        .next_back()
+        .map(|tail| {
+            let tail = tail.trim();
+            tail.eq_ignore_ascii_case("totp") || tail.eq_ignore_ascii_case("verification code")
+        })
+        .unwrap_or(false)
+}
+
+fn has_password_field(fields: &[(String, String)]) -> bool {
+    fields.iter().any(|(label, _)| is_password_label(label))
+}
+
+fn to_totp_code(raw_value: &str) -> Option<String> {
+    let config = parse_totp_config(raw_value)?;
+    let unix_now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    generate_totp_code(
+        &config.secret,
+        config.digits,
+        config.period,
+        unix_now,
+        &config.algorithm,
+    )
+}
+
+struct TotpConfig {
+    secret: Vec<u8>,
+    digits: u32,
+    period: u64,
+    algorithm: String,
+}
+
+fn parse_totp_config(raw_value: &str) -> Option<TotpConfig> {
+    let trimmed = raw_value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.starts_with("otpauth://") {
+        parse_otpauth_uri(trimmed)
+    } else {
+        let secret = decode_base32_secret(trimmed)?;
+        Some(TotpConfig {
+            secret,
+            digits: 6,
+            period: 30,
+            algorithm: "SHA1".to_string(),
+        })
+    }
+}
+
+fn parse_otpauth_uri(uri: &str) -> Option<TotpConfig> {
+    let (_, query) = uri.split_once('?')?;
+    let mut secret = None::<Vec<u8>>;
+    let mut digits = 6_u32;
+    let mut period = 30_u64;
+    let mut algorithm = "SHA1".to_string();
+
+    for pair in query.split('&') {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = raw_key.trim().to_lowercase();
+        let value = percent_decode(raw_value.trim());
+
+        match key.as_str() {
+            "secret" => {
+                secret = decode_base32_secret(&value);
+            }
+            "digits" => {
+                if let Ok(parsed) = value.parse::<u32>() {
+                    if (6..=10).contains(&parsed) {
+                        digits = parsed;
+                    }
+                }
+            }
+            "period" => {
+                if let Ok(parsed) = value.parse::<u64>() {
+                    if parsed > 0 {
+                        period = parsed;
+                    }
+                }
+            }
+            "algorithm" => {
+                let normalized = value.to_uppercase();
+                if normalized == "SHA1" || normalized == "SHA256" || normalized == "SHA512" {
+                    algorithm = normalized;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(TotpConfig {
+        secret: secret?,
+        digits,
+        period,
+        algorithm,
+    })
+}
+
+fn decode_base32_secret(secret: &str) -> Option<Vec<u8>> {
+    let mut bits: u32 = 0;
+    let mut bit_count: u8 = 0;
+    let mut output = Vec::new();
+
+    for ch in secret.chars() {
+        if ch == '=' || ch.is_whitespace() || ch == '-' {
+            continue;
+        }
+
+        let value = match ch.to_ascii_uppercase() {
+            'A'..='Z' => (ch.to_ascii_uppercase() as u8 - b'A') as u8,
+            '2'..='7' => (ch as u8 - b'2') + 26,
+            _ => return None,
+        };
+
+        bits = (bits << 5) | value as u32;
+        bit_count += 5;
+
+        while bit_count >= 8 {
+            bit_count -= 8;
+            output.push(((bits >> bit_count) & 0xFF) as u8);
+        }
+    }
+
+    if output.is_empty() {
+        None
+    } else {
+        Some(output)
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                    output.push((hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+                output.push(bytes[i]);
+                i += 1;
+            }
+            b'+' => {
+                output.push(b' ');
+                i += 1;
+            }
+            other => {
+                output.push(other);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(output).unwrap_or_default()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn generate_totp_code(
+    secret: &[u8],
+    digits: u32,
+    period: u64,
+    unix_time_secs: u64,
+    algorithm: &str,
+) -> Option<String> {
+    if secret.is_empty() || period == 0 {
+        return None;
+    }
+
+    let counter = unix_time_secs / period;
+    let counter_bytes = counter.to_be_bytes();
+    let hmac = hmac_digest(algorithm, secret, &counter_bytes)?;
+
+    let offset = (hmac.last()? & 0x0F) as usize;
+    if offset + 4 > hmac.len() {
+        return None;
+    }
+
+    let binary = ((hmac[offset] as u32 & 0x7F) << 24)
+        | ((hmac[offset + 1] as u32) << 16)
+        | ((hmac[offset + 2] as u32) << 8)
+        | (hmac[offset + 3] as u32);
+    let modulus = 10_u32.checked_pow(digits).unwrap_or(1_000_000);
+    let otp = binary % modulus;
+    let code = format!("{otp:0width$}", width = digits as usize);
+    Some(format_totp_code(&code))
+}
+
+fn hmac_digest(algorithm: &str, key: &[u8], message: &[u8]) -> Option<Vec<u8>> {
+    match algorithm {
+        "SHA256" => {
+            let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
+            mac.update(message);
+            Some(mac.finalize().into_bytes().to_vec())
+        }
+        "SHA512" => {
+            let mut mac = Hmac::<Sha512>::new_from_slice(key).ok()?;
+            mac.update(message);
+            Some(mac.finalize().into_bytes().to_vec())
+        }
+        _ => {
+            let mut mac = Hmac::<Sha1>::new_from_slice(key).ok()?;
+            mac.update(message);
+            Some(mac.finalize().into_bytes().to_vec())
+        }
+    }
+}
+
+fn format_totp_code(code: &str) -> String {
+    if code.len() == 6 {
+        format!("{} {}", &code[..3], &code[3..])
+    } else {
+        code.to_string()
+    }
+}
+
+fn display_fields(fields: &[(String, String)], is_password_visible: bool) -> Vec<(String, String)> {
+    fields
+        .iter()
+        .map(|(label, value)| {
+            if is_password_label(label) && !is_password_visible {
+                (label.clone(), "********".to_string())
+            } else if is_totp_label(label) {
+                match to_totp_code(value) {
+                    Some(code) => (label.clone(), code),
+                    None => (label.clone(), value.clone()),
+                }
+            } else {
+                (label.clone(), value.clone())
+            }
+        })
+        .collect()
+}
+
+fn apply_selected_item(
+    window: &crate::MainWindow,
+    row_index: usize,
+    item: &VaultItemUiState,
+    is_password_visible: bool,
+) {
+    let Ok(index) = i32::try_from(row_index) else {
+        return;
+    };
+
+    window.set_selected_vault_item_index(index);
+    window.set_selected_vault_item_title(item.label.clone().into());
+    window.set_selected_has_password(has_password_field(&item.fields));
+    window.set_is_password_visible(is_password_visible);
+
+    let fields_to_display = display_fields(&item.fields, is_password_visible);
+    window.set_selected_vault_item_fields(model_from_item_fields(&fields_to_display));
+    window.set_selected_vault_item_empty_text(
+        if item.fields.is_empty() {
+            "No non-empty fields were found in this item's data payload."
+        } else {
+            ""
+        }
+        .into(),
+    );
 }
 
 #[derive(Default)]
@@ -122,6 +429,8 @@ fn flatten_tree(
 pub(super) fn attach_handlers(window: &crate::MainWindow) {
     let weak_window = window.as_weak();
     let tree_state = Arc::new(Mutex::new(None::<CollectionTreeState>));
+    let vault_item_state = Arc::new(Mutex::new(Vec::<VaultItemUiState>::new()));
+    let password_visible_state = Arc::new(Mutex::new(false));
 
     {
         let weak_window = weak_window.clone();
@@ -148,8 +457,82 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         });
     }
 
+    {
+        let weak_window = weak_window.clone();
+        let vault_item_state = vault_item_state.clone();
+        let password_visible_state = password_visible_state.clone();
+
+        window.on_vault_item_clicked(move |row_index| {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+
+            let Ok(row_index) = usize::try_from(row_index) else {
+                return;
+            };
+
+            let Ok(items_ref) = vault_item_state.lock() else {
+                return;
+            };
+            let Some(item) = items_ref.get(row_index) else {
+                return;
+            };
+
+            let mut is_password_visible = false;
+            if let Ok(mut visible_state) = password_visible_state.lock() {
+                *visible_state = false;
+            } else {
+                return;
+            }
+
+            if let Ok(visible_state) = password_visible_state.lock() {
+                is_password_visible = *visible_state;
+            }
+
+            apply_selected_item(&window, row_index, item, is_password_visible);
+        });
+    }
+
+    {
+        let weak_window = weak_window.clone();
+        let vault_item_state = vault_item_state.clone();
+        let password_visible_state = password_visible_state.clone();
+
+        window.on_toggle_password_visibility(move || {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+
+            let selected_index = window.get_selected_vault_item_index();
+            let Ok(selected_index) = usize::try_from(selected_index) else {
+                return;
+            };
+
+            let Ok(items_ref) = vault_item_state.lock() else {
+                return;
+            };
+            let Some(item) = items_ref.get(selected_index) else {
+                return;
+            };
+
+            if !has_password_field(&item.fields) {
+                return;
+            }
+
+            let Ok(mut visible_state) = password_visible_state.lock() else {
+                return;
+            };
+            *visible_state = !*visible_state;
+            apply_selected_item(&window, selected_index, item, *visible_state);
+        });
+    }
+
+    let weak_window_for_login = weak_window.clone();
+    let tree_state_for_login = tree_state.clone();
+    let vault_item_state_for_login = vault_item_state.clone();
+    let password_visible_state_for_login = password_visible_state.clone();
     window.on_login_requested(move || {
-        let Some(window) = weak_window.upgrade() else {
+        let Some(window) = weak_window_for_login.upgrade() else {
             return;
         };
 
@@ -168,13 +551,29 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         window.set_collection_tree_rows(ModelRc::new(
             VecModel::<crate::CollectionTreeRow>::default(),
         ));
-        window.set_vault_items(ModelRc::new(VecModel::<SharedString>::default()));
-        if let Ok(mut state) = tree_state.lock() {
+        window.set_vault_item_rows(ModelRc::new(VecModel::<crate::VaultItemRow>::default()));
+        window.set_selected_vault_item_fields(ModelRc::new(
+            VecModel::<crate::VaultItemFieldRow>::default(),
+        ));
+        window.set_selected_vault_item_index(-1);
+        window.set_selected_vault_item_title("".into());
+        window.set_selected_vault_item_empty_text("Select an item to view details.".into());
+        window.set_selected_has_password(false);
+        window.set_is_password_visible(false);
+        if let Ok(mut state) = tree_state_for_login.lock() {
             *state = None;
         }
+        if let Ok(mut items) = vault_item_state_for_login.lock() {
+            items.clear();
+        }
+        if let Ok(mut visible_state) = password_visible_state_for_login.lock() {
+            *visible_state = false;
+        }
 
-        let weak_for_thread = weak_window.clone();
-        let tree_state = tree_state.clone();
+        let weak_for_thread = weak_window_for_login.clone();
+        let tree_state = tree_state_for_login.clone();
+        let vault_item_state = vault_item_state_for_login.clone();
+        let password_visible_state = password_visible_state_for_login.clone();
         thread::spawn(move || {
             let result = crate::auth::try_login(&server_url, &username, &password);
 
@@ -196,9 +595,44 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                             let collection_state =
                                 CollectionTreeState::from_paths(&result.collections);
                             window.set_collection_tree_rows(collection_state.to_model());
-                            window.set_vault_items(model_from_strings(result.items));
+                            let item_rows: Vec<VaultItemUiState> = result
+                                .items
+                                .into_iter()
+                                .map(|item| VaultItemUiState {
+                                    label: item.label,
+                                    fields: item
+                                        .fields
+                                        .into_iter()
+                                        .map(|field| (field.label, field.value))
+                                        .collect(),
+                                })
+                                .collect();
+                            window.set_vault_item_rows(model_from_item_rows(&item_rows));
+                            if item_rows.is_empty() {
+                                window.set_selected_vault_item_index(-1);
+                                window.set_selected_vault_item_title("".into());
+                                window.set_selected_vault_item_fields(ModelRc::new(VecModel::<
+                                    crate::VaultItemFieldRow,
+                                >::default(
+                                )));
+                                window.set_selected_vault_item_empty_text(
+                                    "No vault items loaded.".into(),
+                                );
+                                window.set_selected_has_password(false);
+                                window.set_is_password_visible(false);
+                            } else {
+                                if let Ok(mut visible_state) = password_visible_state.lock() {
+                                    *visible_state = false;
+                                    apply_selected_item(&window, 0, &item_rows[0], *visible_state);
+                                } else {
+                                    apply_selected_item(&window, 0, &item_rows[0], false);
+                                }
+                            }
                             if let Ok(mut state) = tree_state.lock() {
                                 *state = Some(collection_state);
+                            }
+                            if let Ok(mut items) = vault_item_state.lock() {
+                                *items = item_rows;
                             }
                             window.set_is_vault_view(true);
                         }
@@ -211,4 +645,60 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
             });
         });
     });
+
+    schedule_totp_refresh(
+        weak_window.clone(),
+        vault_item_state.clone(),
+        password_visible_state.clone(),
+    );
+}
+
+fn schedule_totp_refresh(
+    weak_window: slint::Weak<crate::MainWindow>,
+    vault_item_state: Arc<Mutex<Vec<VaultItemUiState>>>,
+    password_visible_state: Arc<Mutex<bool>>,
+) {
+    slint::Timer::single_shot(Duration::from_secs(1), move || {
+        if let Some(window) = weak_window.upgrade() {
+            let selected_index = window.get_selected_vault_item_index();
+            if let Ok(selected_index) = usize::try_from(selected_index) {
+                if let Ok(items_ref) = vault_item_state.lock() {
+                    if let Some(item) = items_ref.get(selected_index) {
+                        let is_password_visible = password_visible_state
+                            .lock()
+                            .map(|state| *state)
+                            .unwrap_or(false);
+                        apply_selected_item(&window, selected_index, item, is_password_visible);
+                    }
+                }
+            }
+        }
+
+        schedule_totp_refresh(weak_window, vault_item_state, password_visible_state);
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_base32_secret, generate_totp_code, parse_totp_config};
+
+    #[test]
+    fn generates_known_totp_vector_sha1() {
+        let secret = decode_base32_secret("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ").unwrap();
+        let code = generate_totp_code(&secret, 8, 30, 59, "SHA1").unwrap();
+        assert_eq!(code, "94287082");
+    }
+
+    #[test]
+    fn parses_otpauth_with_query_params() {
+        let config = parse_totp_config(
+            "otpauth://totp/Example:test?secret=JBSWY3DPEHPK3PXP&algorithm=SHA1&digits=6&period=30",
+        )
+        .unwrap();
+
+        assert_eq!(config.digits, 6);
+        assert_eq!(config.period, 30);
+        assert_eq!(config.algorithm, "SHA1");
+        assert!(!config.secret.is_empty());
+    }
 }

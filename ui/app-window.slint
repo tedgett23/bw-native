@@ -8,8 +8,17 @@ export struct CollectionTreeRow {
     is-expanded: bool,
 }
 
+export struct VaultItemRow {
+    label: string,
+}
+
+export struct VaultItemFieldRow {
+    label: string,
+    value: string,
+}
+
 export component MainWindow inherits Window {
-    preferred-width: 800px;
+    preferred-width: 1000px;
     preferred-height: 700px;
     min-width: 500px;
     min-height: 500px;
@@ -24,8 +33,16 @@ export component MainWindow inherits Window {
     in-out property <bool> is-logging-in;
     in-out property <bool> is-vault-view;
     in-out property <[CollectionTreeRow]> collection-tree-rows;
-    in-out property <[string]> vault-items;
+    in-out property <[VaultItemRow]> vault-item-rows;
+    in-out property <int> selected-vault-item-index: -1;
+    in-out property <string> selected-vault-item-title;
+    in-out property <[VaultItemFieldRow]> selected-vault-item-fields;
+    in-out property <string> selected-vault-item-empty-text;
+    in-out property <bool> selected-has-password;
+    in-out property <bool> is-password-visible;
     callback collection-tree-row-clicked(int);
+    callback vault-item-clicked(int);
+    callback toggle-password-visibility();
 
     Rectangle {
         background: #f3f5f8;
@@ -240,17 +257,28 @@ export component MainWindow inherits Window {
 
                             ListView {
                                 vertical-stretch: 1;
-                                for item in root.vault-items: Text {
-                                    text: item;
-                                    color: #223146;
-                                    font-size: 13px;
-                                    vertical-alignment: center;
+                                for row[index] in root.vault-item-rows: Rectangle {
                                     height: 30px;
+                                    background: root.selected-vault-item-index == index ? #e6eefb : transparent;
+                                    border-radius: 4px;
+
+                                    Text {
+                                        text: row.label;
+                                        color: #223146;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                    }
+
+                                    TouchArea {
+                                        clicked => {
+                                            root.vault-item-clicked(index);
+                                        }
+                                    }
                                 }
                             }
 
                             Text {
-                                text: root.vault-items.length > 0 ? "" : "No vault items loaded.";
+                                text: root.vault-item-rows.length > 0 ? "" : "No vault items loaded.";
                                 color: #5a6a82;
                                 font-size: 12px;
                             }
@@ -259,10 +287,140 @@ export component MainWindow inherits Window {
 
                     Rectangle {
                         horizontal-stretch: 1;
-                        background: #f9fbfe;
+                        background: #f6f9fe;
                         border-width: 1px;
                         border-color: #dbe2ec;
                         border-radius: 8px;
+
+                        VerticalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            padding-top: 12px;
+                            padding-bottom: 12px;
+                            spacing: 8px;
+
+                            Text {
+                                text: root.selected-vault-item-title != "" ? root.selected-vault-item-title : "Item Details";
+                                color: #1b2533;
+                                font-size: 20px;
+                                font-weight: 700;
+                            }
+
+                            Rectangle {
+                                background: #ffffff;
+                                border-width: 1px;
+                                border-color: #dbe2ec;
+                                border-radius: 8px;
+                                vertical-stretch: 1;
+
+                                VerticalLayout {
+                                    padding-left: 14px;
+                                    padding-right: 14px;
+                                    padding-top: 12px;
+                                    padding-bottom: 12px;
+                                    spacing: 8px;
+
+                                    HorizontalLayout {
+                                        spacing: 8px;
+
+                                        Text {
+                                            text: "Login Credentials";
+                                            color: #1b2533;
+                                            font-size: 15px;
+                                            font-weight: 700;
+                                        }
+
+                                        Rectangle {
+                                            horizontal-stretch: 1;
+                                            background: transparent;
+                                        }
+
+                                        Button {
+                                            visible: root.selected-has-password;
+                                            text: root.is-password-visible ? "Hide password" : "Show password";
+                                            clicked => {
+                                                root.toggle-password-visibility();
+                                            }
+                                        }
+                                    }
+
+                                    ListView {
+                                        visible: root.selected-vault-item-fields.length > 0;
+                                        vertical-stretch: 1;
+                                        for row[index] in root.selected-vault-item-fields: Rectangle {
+                                            background: transparent;
+                                            height: 56px;
+
+                                            VerticalLayout {
+                                                padding-top: 6px;
+                                                padding-bottom: 6px;
+                                                spacing: 2px;
+
+                                                Text {
+                                                    text: row.label;
+                                                    color: #5b6880;
+                                                    font-size: 12px;
+                                                }
+
+                                                Text {
+                                                    text: row.value;
+                                                    color: #1f2d43;
+                                                    font-size: 15px;
+                                                    font-weight: 600;
+                                                    wrap: word-wrap;
+                                                }
+                                            }
+
+                                            Rectangle {
+                                                y: parent.height - 1px;
+                                                width: parent.width;
+                                                height: 1px;
+                                                background: #e5eaf2;
+                                                visible: index < root.selected-vault-item-fields.length - 1;
+                                            }
+                                        }
+                                    }
+
+                                    Text {
+                                        visible: root.selected-vault-item-fields.length == 0;
+                                        text: root.selected-vault-item-empty-text != "" ? root.selected-vault-item-empty-text : "Select an item to view details.";
+                                        color: #5b6880;
+                                        font-size: 13px;
+                                        wrap: word-wrap;
+                                        vertical-stretch: 1;
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                background: #ffffff;
+                                border-width: 1px;
+                                border-color: #dbe2ec;
+                                border-radius: 8px;
+                                height: 70px;
+
+                                VerticalLayout {
+                                    padding-left: 14px;
+                                    padding-right: 14px;
+                                    padding-top: 10px;
+                                    padding-bottom: 10px;
+                                    spacing: 3px;
+
+                                    Text {
+                                        text: "Item Metadata";
+                                        color: #5b6880;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                    }
+
+                                    Text {
+                                        text: root.selected-vault-item-title != "" ? "Loaded decrypted fields from item data payload." : "No item selected.";
+                                        color: #223146;
+                                        font-size: 12px;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
