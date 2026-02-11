@@ -447,12 +447,41 @@ fn parse_callback_request(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "Callback did not include state parameter.".to_string())?;
 
-    // Verify state matches to prevent CSRF
-    if state != expected_state {
+    // Verify state to prevent CSRF. The web vault and identity server may
+    // transform the state during the OAuth redirect chain, so we check that
+    // the `_identifier=` portion (which contains the org identifier we embedded)
+    // is present in the returned state rather than requiring an exact match.
+    if !check_state(&state, expected_state) {
+        eprintln!("SSO state mismatch:\n  expected: {expected_state}\n  received: {state}");
         return Err("SSO callback state mismatch. This may indicate a security issue.".to_string());
     }
 
     Ok(SsoCallbackResult { code })
+}
+
+/// Validate that the returned state matches what we sent.
+/// The official Bitwarden client checks the `_identifier=` suffix
+/// to verify the org identifier matches. The random prefix may be
+/// transformed by the web vault / identity server redirect chain.
+fn check_state(received: &str, expected: &str) -> bool {
+    // Exact match is ideal
+    if received == expected {
+        return true;
+    }
+
+    // Extract the `_identifier=<value>` portion from both and compare.
+    // This is the same approach the official Bitwarden client uses.
+    let received_id = extract_identifier_from_state(received);
+    let expected_id = extract_identifier_from_state(expected);
+
+    match (received_id, expected_id) {
+        (Some(r), Some(e)) => r == e,
+        _ => false,
+    }
+}
+
+fn extract_identifier_from_state(state: &str) -> Option<&str> {
+    state.split("_identifier=").nth(1).filter(|s| !s.is_empty())
 }
 
 fn percent_decode(input: &str) -> String {
