@@ -1,11 +1,19 @@
-import { Button, LineEdit } from "std-widgets.slint";
+import { Button, LineEdit, ListView } from "std-widgets.slint";
+
+export struct CollectionTreeRow {
+    id: string,
+    label: string,
+    depth: int,
+    has-children: bool,
+    is-expanded: bool,
+}
 
 export component MainWindow inherits Window {
-    preferred-width: 500px;
-    preferred-height: 460px;
-    min-width: 420px;
-    min-height: 400px;
-    title: "Bitwarden Login";
+    preferred-width: 800px;
+    preferred-height: 700px;
+    min-width: 500px;
+    min-height: 500px;
+    title: root.is-vault-view ? "Bitwarden Vault" : "Bitwarden Login";
 
     callback login-requested();
     in-out property <string> server-url: "https://vault.bitwarden.com";
@@ -14,6 +22,10 @@ export component MainWindow inherits Window {
     in-out property <string> status-text;
     in-out property <bool> status-is-error;
     in-out property <bool> is-logging-in;
+    in-out property <bool> is-vault-view;
+    in-out property <[CollectionTreeRow]> collection-tree-rows;
+    in-out property <[string]> vault-items;
+    callback collection-tree-row-clicked(int);
 
     Rectangle {
         background: #f3f5f8;
@@ -27,13 +39,14 @@ export component MainWindow inherits Window {
             border-width: 1px;
             border-color: #d2d8e1;
             border-radius: 10px;
+            visible: !root.is-vault-view;
 
             VerticalLayout {
                 padding-left: 24px;
                 padding-right: 24px;
                 padding-top: 20px;
                 padding-bottom: 20px;
-                spacing: 12px;
+                spacing: 10px;
 
                 Text {
                     text: "Sign in to Bitwarden";
@@ -103,6 +116,153 @@ export component MainWindow inherits Window {
                     enabled: !root.is-logging-in;
                     clicked => {
                         root.login-requested();
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            x: 40px;
+            y: 40px;
+            width: parent.width - 80px;
+            height: parent.height - 80px;
+            background: #ffffff;
+            border-width: 1px;
+            border-color: #d2d8e1;
+            border-radius: 10px;
+            visible: root.is-vault-view;
+
+            VerticalLayout {
+                padding-left: 24px;
+                padding-right: 24px;
+                padding-top: 20px;
+                padding-bottom: 20px;
+                spacing: 12px;
+
+                Text {
+                    text: "Bitwarden Vault";
+                    color: #1b2533;
+                    font-size: 24px;
+                    font-weight: 700;
+                }
+
+                HorizontalLayout {
+                    spacing: 12px;
+                    vertical-stretch: 1;
+
+                    Rectangle {
+                        width: 200px;
+                        background: #f9fbfe;
+                        border-width: 1px;
+                        border-color: #dbe2ec;
+                        border-radius: 8px;
+
+                        VerticalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            padding-top: 12px;
+                            padding-bottom: 12px;
+                            spacing: 8px;
+
+                            Text {
+                                text: "Collections";
+                                color: #1b2533;
+                                font-size: 14px;
+                                font-weight: 700;
+                            }
+
+                            ListView {
+                                vertical-stretch: 1;
+                                for row[index] in root.collection-tree-rows: Rectangle {
+                                    height: 28px;
+                                    background: transparent;
+
+                                    HorizontalLayout {
+                                        spacing: 4px;
+
+                                        Rectangle {
+                                            width: row.depth * 14px;
+                                            background: transparent;
+                                        }
+
+                                        Text {
+                                            text: row.has-children ? (row.is-expanded ? "v" : ">") : "";
+                                            color: #5a6a82;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                            width: 12px;
+                                        }
+
+                                        Text {
+                                            text: row.label;
+                                            color: #223146;
+                                            font-size: 13px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    TouchArea {
+                                        clicked => {
+                                            root.collection-tree-row-clicked(index);
+                                        }
+                                    }
+                                }
+                            }
+
+                            Text {
+                                text: root.collection-tree-rows.length > 0 ? "" : "No collections loaded.";
+                                color: #5a6a82;
+                                font-size: 12px;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 200px;
+                        background: #f9fbfe;
+                        border-width: 1px;
+                        border-color: #dbe2ec;
+                        border-radius: 8px;
+
+                        VerticalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            padding-top: 12px;
+                            padding-bottom: 12px;
+                            spacing: 8px;
+
+                            Text {
+                                text: "Vault Items";
+                                color: #1b2533;
+                                font-size: 14px;
+                                font-weight: 700;
+                            }
+
+                            ListView {
+                                vertical-stretch: 1;
+                                for item in root.vault-items: Text {
+                                    text: item;
+                                    color: #223146;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    height: 30px;
+                                }
+                            }
+
+                            Text {
+                                text: root.vault-items.length > 0 ? "" : "No vault items loaded.";
+                                color: #5a6a82;
+                                font-size: 12px;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        background: #f9fbfe;
+                        border-width: 1px;
+                        border-color: #dbe2ec;
+                        border-radius: 8px;
                     }
                 }
             }

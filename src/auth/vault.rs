@@ -32,6 +32,11 @@ struct CipherString {
     raw_ciphertext: String,
 }
 
+pub(super) struct DecryptedVaultView {
+    pub(super) collections: Vec<String>,
+    pub(super) items: Vec<String>,
+}
+
 impl SymmetricKey {
     fn from_slice(bytes: &[u8]) -> Result<Self, String> {
         match bytes.len() {
@@ -64,13 +69,13 @@ impl SymmetricKey {
     }
 }
 
-pub(super) fn sync_and_print_vault(
+pub(super) fn sync_and_decrypt_vault(
     client: &Client,
     api_base_url: &str,
     access_token: &str,
     master_key: &[u8; 32],
     protected_user_key: &str,
-) -> Result<(), String> {
+) -> Result<DecryptedVaultView, String> {
     let sync_url = format!("{api_base_url}/sync?excludeDomains=true");
     let sync_response = client
         .get(sync_url)
@@ -93,16 +98,7 @@ pub(super) fn sync_and_print_vault(
 
     let user_key = decrypt_user_key(master_key, protected_user_key)?;
     decrypt_sync_payload(&mut sync_json, &user_key)?;
-
-    println!("===== Decrypted Bitwarden Vault =====");
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&sync_json)
-            .map_err(|error| format!("Failed to render decrypted vault JSON: {error}"))?
-    );
-    println!("===== End Vault =====");
-
-    Ok(())
+    Ok(build_vault_view(&sync_json))
 }
 
 fn decrypt_sync_payload(sync_json: &mut Value, user_key: &SymmetricKey) -> Result<(), String> {
@@ -653,4 +649,60 @@ fn decode_base64(data: &str) -> Result<Vec<u8>, String> {
         .decode(data)
         .or_else(|_| STANDARD_NO_PAD.decode(data))
         .map_err(|error| format!("Invalid base64 ciphertext segment: {error}"))
+}
+
+fn build_vault_view(sync_json: &Value) -> DecryptedVaultView {
+    DecryptedVaultView {
+        collections: build_collection_list(sync_json),
+        items: build_item_list(sync_json),
+    }
+}
+
+fn build_collection_list(sync_json: &Value) -> Vec<String> {
+    let Some(collections) = sync_json.get("collections").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    collections
+        .iter()
+        .filter_map(|collection| {
+            let name = collection
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Unnamed collection");
+            Some(name.to_string())
+        })
+        .collect()
+}
+
+fn build_item_list(sync_json: &Value) -> Vec<String> {
+    let Some(ciphers) = sync_json.get("ciphers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    ciphers
+        .iter()
+        .map(|cipher| {
+            let name = cipher
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("Unnamed item");
+
+            let username = cipher
+                .get("login")
+                .and_then(|login| login.get("username"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+
+            match username {
+                Some(username) => format!("{name} ({username})"),
+                None => name.to_string(),
+            }
+        })
+        .collect()
 }

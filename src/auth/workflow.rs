@@ -8,9 +8,14 @@ use super::crypto::{derive_master_key, derive_password_hash, kdf_config_from_pre
 use super::errors::extract_error_message;
 use super::models::{PreloginRequest, PreloginResponse, TokenSuccessResponse};
 use super::server::{normalize_email, resolve_api_base_url, resolve_identity_base_url};
-use super::vault::sync_and_print_vault;
+use super::vault::sync_and_decrypt_vault;
 
-pub fn try_login(server_url: &str, username: &str, password: &str) -> Result<(), String> {
+pub struct LoginResult {
+    pub collections: Vec<String>,
+    pub items: Vec<String>,
+}
+
+pub fn try_login(server_url: &str, username: &str, password: &str) -> Result<LoginResult, String> {
     let server_url = server_url.trim();
     let username = username.trim();
     let password = password.trim();
@@ -83,10 +88,6 @@ pub fn try_login(server_url: &str, username: &str, password: &str) -> Result<(),
     let status = token_response.status();
     let body = token_response.text().unwrap_or_default();
 
-    println!("===== Token Response ({status}) =====");
-    println!("{body}");
-    println!("===== End Token Response =====");
-
     if !status.is_success() {
         return Err(format!(
             "Login failed ({status}): {}",
@@ -104,12 +105,7 @@ pub fn try_login(server_url: &str, username: &str, password: &str) -> Result<(),
         .key
         .ok_or_else(|| "Login response did not include the encrypted user key.".to_string())?;
 
-    println!(
-        "Token parse summary: access_token_present=true key_present=true key_len={}",
-        protected_user_key.len()
-    );
-
-    sync_and_print_vault(
+    let vault_view = sync_and_decrypt_vault(
         &client,
         &api_base_url,
         &access_token,
@@ -117,5 +113,8 @@ pub fn try_login(server_url: &str, username: &str, password: &str) -> Result<(),
         &protected_user_key,
     )?;
 
-    Ok(())
+    Ok(LoginResult {
+        collections: vault_view.collections,
+        items: vault_view.items,
+    })
 }
