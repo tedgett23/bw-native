@@ -523,95 +523,104 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
     {
         let weak_window = weak_window.clone();
         let tree_state = tree_state.clone();
-        let vault_item_state = vault_item_state.clone();
-        let visible_item_indices_state = visible_item_indices_state.clone();
-        let password_visible_state = password_visible_state.clone();
-        let active_collection_id = active_collection_id.clone();
 
+        // Expand/collapse only — fired by clicking the arrow icon.
         window.on_collection_tree_row_clicked(move |row_index| {
             let Some(window) = weak_window.upgrade() else {
                 return;
             };
-
             let Ok(row_index) = usize::try_from(row_index) else {
                 return;
             };
-
             let Ok(mut state_ref) = tree_state.lock() else {
                 return;
             };
             let Some(state) = state_ref.as_mut() else {
                 return;
             };
+            state.toggle_row(row_index);
+            window.set_collection_tree_rows(state.to_model());
+        });
+    }
 
-            // For parent nodes: toggle expand/collapse.
-            // For leaf nodes: select the collection as the active filter.
-            let row = state.visible_rows.get(row_index).cloned();
-            let Some(row) = row else { return };
+    {
+        let weak_window = weak_window.clone();
+        let tree_state = tree_state.clone();
+        let vault_item_state = vault_item_state.clone();
+        let visible_item_indices_state = visible_item_indices_state.clone();
+        let password_visible_state = password_visible_state.clone();
+        let active_collection_id = active_collection_id.clone();
 
-            if row.has_children {
-                // Parent node: toggle expand/collapse.
-                state.toggle_row(row_index);
-                window.set_collection_tree_rows(state.to_model());
-            }
+        // Select as active filter — fired by clicking the label text.
+        window.on_collection_tree_row_selected(move |row_index| {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let Ok(row_index) = usize::try_from(row_index) else {
+                return;
+            };
 
-            {
-                // Any node (parent or leaf): toggle as active collection filter.
-                let node_path = row.id.to_string();
-
-                // Toggle: clicking the already-selected node deselects it.
-                let new_active = {
-                    let Ok(mut active_ref) = active_collection_id.lock() else {
-                        return;
-                    };
-                    if active_ref.as_deref() == Some(&node_path) {
-                        *active_ref = None;
-                        None
-                    } else {
-                        *active_ref = Some(node_path.clone());
-                        Some(node_path)
-                    }
-                };
-
-                window.set_active_collection_id(new_active.as_deref().unwrap_or("").into());
-
-                // Resolve UUIDs for the selected node and all its descendants.
-                let active_uuids = new_active
-                    .as_deref()
-                    .map(|path| state.collect_uuids_for_path(path));
-
-                // Refilter items using both search query and new collection filter.
-                let search_query = window.get_search_query().to_string();
-                let Ok(items_ref) = vault_item_state.lock() else {
+            // Resolve the node path and its UUID set while holding the tree lock,
+            // then release before taking any other locks.
+            let (node_path, uuids) = {
+                let Ok(state_ref) = tree_state.lock() else {
                     return;
                 };
-                let next_indices =
-                    build_visible_item_indices(&items_ref, &search_query, active_uuids.as_ref());
-                window.set_vault_item_rows(model_from_item_rows(&items_ref, &next_indices));
+                let Some(state) = state_ref.as_ref() else {
+                    return;
+                };
+                let Some(row) = state.visible_rows.get(row_index) else {
+                    return;
+                };
+                let path = row.id.to_string();
+                let uuids = state.collect_uuids_for_path(&path);
+                (path, uuids)
+            };
 
-                if let Ok(mut visible_ref) = visible_item_indices_state.lock() {
-                    *visible_ref = next_indices.clone();
+            // Toggle: clicking the already-selected node deselects it.
+            let new_active_uuids = {
+                let Ok(mut active_ref) = active_collection_id.lock() else {
+                    return;
+                };
+                if active_ref.as_deref() == Some(&node_path) {
+                    *active_ref = None;
+                    window.set_active_collection_id("".into());
+                    None
+                } else {
+                    *active_ref = Some(node_path);
+                    window.set_active_collection_id(active_ref.as_deref().unwrap_or("").into());
+                    Some(uuids)
                 }
+            };
 
-                if let Ok(mut pw) = password_visible_state.lock() {
-                    *pw = false;
-                }
-                window.set_is_password_visible(false);
+            let search_query = window.get_search_query().to_string();
+            let Ok(items_ref) = vault_item_state.lock() else {
+                return;
+            };
+            let next_indices =
+                build_visible_item_indices(&items_ref, &search_query, new_active_uuids.as_ref());
+            window.set_vault_item_rows(model_from_item_rows(&items_ref, &next_indices));
 
-                if next_indices.is_empty() {
-                    window.set_selected_vault_item_index(-1);
-                    window.set_selected_vault_item_title("".into());
-                    window.set_selected_vault_item_fields(ModelRc::new(VecModel::<
-                        crate::VaultItemFieldRow,
-                    >::default(
-                    )));
-                    window.set_selected_vault_item_empty_text(
-                        "No vault items in this collection.".into(),
-                    );
-                    window.set_selected_has_password(false);
-                } else if let Some(item) = items_ref.get(next_indices[0]) {
-                    apply_selected_item(&window, 0, item, false);
-                }
+            if let Ok(mut visible_ref) = visible_item_indices_state.lock() {
+                *visible_ref = next_indices.clone();
+            }
+            if let Ok(mut pw) = password_visible_state.lock() {
+                *pw = false;
+            }
+            window.set_is_password_visible(false);
+
+            if next_indices.is_empty() {
+                window.set_selected_vault_item_index(-1);
+                window.set_selected_vault_item_title("".into());
+                window.set_selected_vault_item_fields(ModelRc::new(VecModel::<
+                    crate::VaultItemFieldRow,
+                >::default()));
+                window.set_selected_vault_item_empty_text(
+                    "No vault items in this collection.".into(),
+                );
+                window.set_selected_has_password(false);
+            } else if let Some(item) = items_ref.get(next_indices[0]) {
+                apply_selected_item(&window, 0, item, false);
             }
         });
     }

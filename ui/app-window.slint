@@ -67,7 +67,8 @@ export component MainWindow inherits Window {
     in-out property <string> selected-vault-item-empty-text;
     in-out property <bool> selected-has-password;
     in-out property <bool> is-password-visible;
-    callback collection-tree-row-clicked(int);
+    callback collection-tree-row-clicked(int);    // expand/collapse toggle
+    callback collection-tree-row-selected(int);   // select as active filter
     callback collection-all-items-clicked();
     callback vault-item-clicked(int);
     callback search-requested();
@@ -428,37 +429,61 @@ export component MainWindow inherits Window {
                                 vertical-stretch: 1;
                                 for row[index] in root.collection-tree-rows: Rectangle {
                                     height: 28px;
-                                    background: !row.has-children && root.active-collection-id == row.id ? root.color-accent-soft : transparent;
+                                    background: root.active-collection-id == row.id ? root.color-accent-soft : transparent;
                                     border-radius: 4px;
 
                                     HorizontalLayout {
                                         spacing: 4px;
 
+                                        // Indentation spacer
                                         Rectangle {
                                             width: row.depth * 14px;
                                             background: transparent;
                                         }
 
-                                        Text {
-                                            text: row.has-children ? (row.is-expanded ? "v" : ">") : "";
-                                            color: root.color-text-muted;
-                                            font-size: 12px;
-                                            vertical-alignment: center;
-                                            width: 12px;
+                                        // Expand/collapse arrow — only responds to clicks when node has children
+                                        Rectangle {
+                                            width: 16px;
+                                            background: transparent;
+
+                                            Text {
+                                                text: row.has-children ? (row.is-expanded ? "v" : ">") : "";
+                                                color: root.color-text-muted;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                                horizontal-alignment: center;
+                                                width: parent.width;
+                                                height: parent.height;
+                                            }
+
+                                            TouchArea {
+                                                enabled: row.has-children;
+                                                clicked => {
+                                                    root.collection-tree-row-clicked(index);
+                                                }
+                                            }
                                         }
 
-                                        Text {
-                                            text: row.label;
-                                            color: !row.has-children && root.active-collection-id == row.id ? root.color-text-primary : root.color-text-secondary;
-                                            font-size: 13px;
-                                            font-weight: !row.has-children && root.active-collection-id == row.id ? 600 : 400;
-                                            vertical-alignment: center;
-                                        }
-                                    }
+                                        // Label — clicking always selects this node as the active filter
+                                        Rectangle {
+                                            horizontal-stretch: 1;
+                                            background: transparent;
 
-                                    TouchArea {
-                                        clicked => {
-                                            root.collection-tree-row-clicked(index);
+                                            Text {
+                                                text: row.label;
+                                                color: root.active-collection-id == row.id ? root.color-text-primary : root.color-text-secondary;
+                                                font-size: 13px;
+                                                font-weight: root.active-collection-id == row.id ? 600 : 400;
+                                                vertical-alignment: center;
+                                                width: parent.width;
+                                                height: parent.height;
+                                            }
+
+                                            TouchArea {
+                                                clicked => {
+                                                    root.collection-tree-row-selected(index);
+                                                }
+                                            }
                                         }
                                     }
                                 }
