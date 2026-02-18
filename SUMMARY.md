@@ -26,12 +26,12 @@ bw-native/
 │   │   └── workflow.rs         # High-level password login orchestration
 │   └── ui/                     # Slint ↔ Rust glue
 │       ├── mod.rs              # Creates MainWindow and starts event loop
-│       └── login_controller.rs # All UI event handlers, TOTP generation, search, TDE polling (~1,350 lines)
+│       └── login_controller.rs # All UI event handlers, TOTP generation, search, TDE polling (~1,500 lines)
 └── ui/
-    └── app-window.slint        # Complete UI definition (login + SSO + TDE approval + vault views, ~660 lines)
+    └── app-window.slint        # Complete UI definition (login + SSO + TDE approval + vault views, ~700 lines)
 ```
 
-**~3,700 lines of code total.**
+**~3,900 lines of code total.**
 
 ---
 
@@ -55,7 +55,7 @@ bw-native/
 
 - **Public entry points:** `auth::try_login(server_url, username, password)` for password login, `auth::try_sso_login(server_url, org_identifier, email)` for SSO (returns an enum describing the required next step), `auth::complete_sso_with_master_password(...)` for vault decryption after SSO with master password, `auth::complete_tde_after_approval(...)` for vault decryption after TDE auth-request approval.
 - **Threading:** Slint runs on the main thread. Blocking network I/O runs on a background `std::thread`. Cross-thread UI updates use `slint::invoke_from_event_loop`.
-- **Shared state:** `Arc<Mutex<T>>` wrappers for collection tree state, vault items, visible indices, password visibility, SSO pending state, and TDE pending state.
+- **Shared state:** `Arc<Mutex<T>>` wrappers for collection tree state, vault items, visible indices, password visibility, active collection filter, SSO pending state, and TDE pending state.
 - **Error handling:** `Result<T, String>` throughout with contextual error messages. API errors are parsed to extract user-friendly messages.
 - **Renderer fallback:** `main.rs` catches panics/errors from Slint initialization and relaunches the process with `SLINT_BACKEND=winit-software` if hardware rendering fails.
 
@@ -181,13 +181,20 @@ Path a — Master password:
 
 | Collections Panel (200px) | Items Panel (300px) | Details Panel (flex) |
 |---|---|---|
-| Hierarchical tree with expand/collapse | Searchable list with selection highlighting | Item title, credential fields, metadata |
+| Hierarchical tree with expand/collapse and collection filtering | Searchable list with selection highlighting | Item title, credential fields, metadata |
 
 ### Slint Structs (shared with Rust)
 
 - `CollectionTreeRow` — `{ id, label, depth, has-children, is-expanded }`
 - `VaultItemRow` — `{ label }`
 - `VaultItemFieldRow` — `{ label, value }`
+
+### Slint Callbacks (vault view)
+
+- `collection-tree-row-clicked(int)` — fired by the `>` expand/collapse arrow; toggles tree expand state only
+- `collection-tree-row-selected(int)` — fired by clicking the collection label; sets or clears the active collection filter
+- `collection-all-items-clicked()` — fired by the "All Items" row at the top of the tree; clears the collection filter
+- `vault-item-clicked(int)`, `search-requested()`, `toggle-password-visibility()` — item panel interactions
 
 ### Color Palette (dark theme)
 
@@ -199,7 +206,8 @@ All colors are hardcoded constants in the `.slint` file (e.g., `#0a111d` backgro
 
 - **Search:** Case-insensitive filtering across item labels and field values. Passwords and TOTP secrets are excluded from search for security.
 - **TOTP generation:** Parses `otpauth://` URIs and raw Base32 secrets. Supports SHA1/SHA256/SHA512, configurable digits and period. Auto-refreshes every second via `slint::Timer`. Formats codes as "123 456".
-- **Collection tree:** Builds a hierarchical tree from flat collection path strings. Supports expand/collapse toggling with visual depth indentation.
+- **Collection tree:** Builds a hierarchical tree from `(uuid, name_path)` pairs. Each `TreeNode` stores the Bitwarden UUIDs of collections whose name path ends at that node. Supports expand/collapse toggling (via arrow click) independently from collection selection (via label click). `collect_uuids_for_path` walks the tree to gather UUIDs for a node and all its descendants, enabling parent-level filtering.
+- **Collection filtering:** `active_collection_id: Arc<Mutex<Option<String>>>` holds the name-path of the currently selected tree node. Item visibility is computed by checking whether any of the item's `collection_ids` (Bitwarden UUIDs) intersect the resolved UUID set for the active node. Composes with search: both filters apply simultaneously. An "All Items" entry clears the filter. Clicking an already-selected node deselects it.
 - **Password visibility:** Toggle between masked (`********`) and plaintext display.
 - **SSO state management:** `SsoPendingState` holds the access token, encrypted user key, KDF config, and HTTP client between SSO token exchange and master password submission.
 - **TDE state management:** `TdePendingState` holds the access token, auth request IDs, access code, ephemeral RSA private key, and HTTP client while waiting for device/admin approval. A 10-second `slint::Timer` polls the approval endpoints on a background thread and auto-completes the vault unlock when approved.
@@ -223,18 +231,34 @@ All colors are hardcoded constants in the `.slint` file (e.g., `#0a111d` backgro
 
 ```rust
 pub struct LoginResult {
-    pub collections: Vec<String>,
+    pub collections: Vec<(String, String)>,  // (collection_uuid, decrypted_name_path)
     pub items: Vec<VaultItemView>,
 }
 
 pub struct VaultItemView {
     pub label: String,
     pub fields: Vec<VaultItemFieldView>,
+    pub collection_ids: Vec<String>,  // Bitwarden UUIDs this item belongs to
 }
 
 pub struct VaultItemFieldView {
     pub label: String,
     pub value: String,
+}
+```
+
+### auth/vault.rs — Internal decryption types
+
+```rust
+pub(super) struct DecryptedVaultView {
+    pub(super) collections: Vec<(String, String)>,  // (uuid, decrypted_name_path)
+    pub(super) items: Vec<DecryptedVaultItem>,
+}
+
+pub(super) struct DecryptedVaultItem {
+    pub(super) label: String,
+    pub(super) fields: Vec<DecryptedVaultField>,
+    pub(super) collection_ids: Vec<String>,
 }
 ```
 
@@ -332,16 +356,4 @@ Requires a Rust toolchain with edition 2024 support.
 
 ## TODO
 
-### Make Collections Clickable to Filter Vault Items
-
-Currently, collections are displayed in a tree panel but clicking them only toggles expand/collapse for parent nodes. Selecting a collection should filter the items panel to show only items belonging to that collection (or its children). This involves:
-
-- **Track collection membership:** The vault sync response includes `collectionIds` on each cipher object. During decryption in `vault.rs`, preserve the mapping of each item to its collection IDs. Propagate this data through `DecryptedVaultItem` → `VaultItemView` so the controller has access.
-- **Collection selection state:** Add a "selected collection" state to the controller (in addition to the existing expand/collapse state). Clicking a leaf collection selects it; clicking a parent collection could either select it (showing all items in it and its children) or just expand/collapse.
-- **Filter logic:** When a collection is selected, filter the visible items list to only those whose `collectionIds` include the selected collection. This interacts with the existing search feature — both filters should compose (search within selected collection).
-- **UI feedback:** Highlight the selected collection row in the tree. Add an "All Items" option at the top to clear the filter. Update the items panel title or add a breadcrumb to show which collection is active.
-- **Files to modify:**
-  - `src/auth/vault.rs` — Include `collection_ids: Vec<String>` in `DecryptedVaultItem` and populate it from cipher data
-  - `src/auth/workflow.rs` — Propagate `collection_ids` through `VaultItemView`
-  - `src/ui/login_controller.rs` — Add collection selection state, update `on_collection_tree_row_clicked` to set active collection filter, update item filtering to compose with search
-  - `ui/app-window.slint` — Add visual selection state for collection rows, possibly an "All Items" entry
+No open items.
