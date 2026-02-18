@@ -222,18 +222,25 @@ pub fn try_sso_login(
         .as_ref()
         .and_then(|o| o.trusted_device_option.clone());
 
-    // ── Path 1: Master password ───────────────────────────────────────────────
-    if has_master_password || (tde_option.is_none() && !protected_user_key.is_empty()) {
-        return Ok(SsoTokenResult::NeedsMasterPassword {
-            access_token,
-            protected_user_key,
-            api_base_url,
-            kdf_config,
-            client,
-        });
+    // ── Path 1: TDE takes priority ────────────────────────────────────────────
+    // Check TDE first. If trustedDeviceOption is present the account uses TDE
+    // regardless of whether protected_user_key is also set in the response.
+    // Only fall through to master-password if there is genuinely no TDE option.
+
+    // ── Path 2 (fallback): Master password ───────────────────────────────────
+    if tde_option.is_none() {
+        if has_master_password || !protected_user_key.is_empty() {
+            return Ok(SsoTokenResult::NeedsMasterPassword {
+                access_token,
+                protected_user_key,
+                api_base_url,
+                kdf_config,
+                client,
+            });
+        }
     }
 
-    // ── Path 2: TDE ───────────────────────────────────────────────────────────
+    // ── TDE path ──────────────────────────────────────────────────────────────
     let tde = match tde_option {
         Some(t) => t,
         None => {
