@@ -79,6 +79,44 @@ impl SymmetricKey {
     }
 }
 
+/// Sync and decrypt the vault using a pre-derived 64-byte user key (TDE path).
+/// The `user_key_bytes` array is split into enc (first 32) + mac (last 32).
+pub(super) fn sync_and_decrypt_vault_raw_key(
+    client: &Client,
+    api_base_url: &str,
+    access_token: &str,
+    user_key_bytes: &[u8; 64],
+) -> Result<DecryptedVaultView, String> {
+    let sync_url = format!("{api_base_url}/sync?excludeDomains=true");
+    let sync_response = client
+        .get(sync_url)
+        .bearer_auth(access_token)
+        .send()
+        .map_err(|error| format!("Sync request failed: {error}"))?;
+
+    let status = sync_response.status();
+    let body = sync_response.text().unwrap_or_default();
+
+    if !status.is_success() {
+        return Err(format!(
+            "Sync failed ({status}): {}",
+            extract_error_message(&body)
+        ));
+    }
+
+    let mut sync_json: Value = serde_json::from_str(&body)
+        .map_err(|error| format!("Invalid sync response JSON: {error}"))?;
+
+    let mut enc = [0u8; 32];
+    let mut mac = [0u8; 32];
+    enc.copy_from_slice(&user_key_bytes[..32]);
+    mac.copy_from_slice(&user_key_bytes[32..]);
+    let user_key = SymmetricKey::from_enc_mac(enc, mac);
+
+    decrypt_sync_payload(&mut sync_json, &user_key)?;
+    Ok(build_vault_view(&sync_json))
+}
+
 pub(super) fn sync_and_decrypt_vault(
     client: &Client,
     api_base_url: &str,

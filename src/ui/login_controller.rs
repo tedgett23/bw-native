@@ -9,7 +9,8 @@ use sha1::Sha1;
 use sha2::{Sha256, Sha512};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
-use crate::auth::sso::KdfConfigSnapshot;
+use crate::auth::LoginResult;
+use crate::auth::sso::{KdfConfigSnapshot, TdePendingState};
 
 /// Holds the SSO token exchange result while waiting for the user to enter
 /// their master password to decrypt the vault.
@@ -800,10 +801,16 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
     });
 
     let sso_pending_state: Arc<Mutex<Option<SsoPendingState>>> = Arc::new(Mutex::new(None));
+    let tde_pending_state: Arc<Mutex<Option<TdePendingState>>> = Arc::new(Mutex::new(None));
 
     {
         let weak_window = weak_window.clone();
         let sso_pending_state = sso_pending_state.clone();
+        let tde_pending_state = tde_pending_state.clone();
+        let tree_state = tree_state.clone();
+        let vault_item_state = vault_item_state.clone();
+        let visible_item_indices_state = visible_item_indices_state.clone();
+        let password_visible_state = password_visible_state.clone();
 
         window.on_sso_login_requested(move || {
             let Some(window) = weak_window.upgrade() else {
@@ -824,8 +831,13 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
 
             let weak_for_thread = weak_window.clone();
             let sso_pending = sso_pending_state.clone();
+            let tde_pending = tde_pending_state.clone();
+            let tree_state = tree_state.clone();
+            let vault_item_state = vault_item_state.clone();
+            let visible_item_indices = visible_item_indices_state.clone();
+            let password_visible_state = password_visible_state.clone();
             thread::spawn(move || {
-                let result = crate::auth::try_sso_login(&server_url, &org_identifier);
+                let result = crate::auth::try_sso_login(&server_url, &org_identifier, &email);
 
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(window) = weak_for_thread.upgrade() {
@@ -853,6 +865,32 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                                 window.set_is_sso_awaiting_password(true);
                                 window.set_sso_master_password("".into());
                             }
+                            Ok(crate::auth::SsoTokenResult::TrustedDeviceDecrypted(result)) => {
+                                // Device was already trusted — vault decrypted immediately.
+                                populate_vault_after_login(
+                                    &window,
+                                    result,
+                                    "SSO login successful (trusted device). Loaded {} collections and {} items.",
+                                    &tree_state,
+                                    &vault_item_state,
+                                    &visible_item_indices,
+                                    &password_visible_state,
+                                );
+                            }
+                            Ok(crate::auth::SsoTokenResult::NeedsDeviceApproval {
+                                pending,
+                                fingerprint,
+                            }) => {
+                                if let Ok(mut tde) = tde_pending.lock() {
+                                    *tde = Some(pending);
+                                }
+                                window.set_status_is_error(false);
+                                window.set_status_text(
+                                    "Waiting for approval… check your other devices or the admin console.".into(),
+                                );
+                                window.set_tde_fingerprint(fingerprint.into());
+                                window.set_is_tde_awaiting_approval(true);
+                            }
                             Ok(crate::auth::SsoTokenResult::NoDecryptionPath { message }) => {
                                 window.set_status_is_error(true);
                                 window.set_status_text(message.into());
@@ -865,6 +903,25 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                     }
                 });
             });
+        });
+    }
+
+    // ── TDE cancel ────────────────────────────────────────────────────────────
+    {
+        let weak_window = weak_window.clone();
+        let tde_pending_state = tde_pending_state.clone();
+
+        window.on_tde_approval_cancel_requested(move || {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            if let Ok(mut tde) = tde_pending_state.lock() {
+                *tde = None;
+            }
+            window.set_is_tde_awaiting_approval(false);
+            window.set_tde_fingerprint("".into());
+            window.set_status_text("".into());
+            window.set_status_is_error(false);
         });
     }
 
@@ -1023,6 +1080,224 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         visible_item_indices_state.clone(),
         password_visible_state.clone(),
     );
+
+    schedule_tde_approval_poll(
+        weak_window.clone(),
+        tde_pending_state.clone(),
+        tree_state.clone(),
+        vault_item_state.clone(),
+        visible_item_indices_state.clone(),
+        password_visible_state.clone(),
+    );
+}
+
+/// Populate the vault UI after a successful login (any path).
+/// `status_template` must contain two `{}` placeholders for collection and item counts.
+fn populate_vault_after_login(
+    window: &crate::MainWindow,
+    result: LoginResult,
+    status_template: &str,
+    tree_state: &Arc<Mutex<Option<CollectionTreeState>>>,
+    vault_item_state: &Arc<Mutex<Vec<VaultItemUiState>>>,
+    visible_item_indices: &Arc<Mutex<Vec<usize>>>,
+    password_visible_state: &Arc<Mutex<bool>>,
+) {
+    window.set_status_is_error(false);
+    window.set_status_text(
+        status_template
+            .replacen("{}", &result.collections.len().to_string(), 1)
+            .replacen("{}", &result.items.len().to_string(), 1)
+            .into(),
+    );
+    window.set_sso_master_password("".into());
+    window.set_is_sso_awaiting_password(false);
+    window.set_is_tde_awaiting_approval(false);
+    window.set_tde_fingerprint("".into());
+    window.set_search_query("".into());
+    window.set_has_active_search(false);
+
+    let collection_state = CollectionTreeState::from_paths(&result.collections);
+    window.set_collection_tree_rows(collection_state.to_model());
+
+    let item_rows: Vec<VaultItemUiState> = result
+        .items
+        .into_iter()
+        .map(|item| VaultItemUiState {
+            label: item.label,
+            fields: item
+                .fields
+                .into_iter()
+                .map(|field| (field.label, field.value))
+                .collect(),
+        })
+        .collect();
+
+    let visible_indices: Vec<usize> = (0..item_rows.len()).collect();
+    window.set_vault_item_rows(model_from_item_rows(&item_rows, &visible_indices));
+
+    if item_rows.is_empty() {
+        window.set_selected_vault_item_index(-1);
+        window.set_selected_vault_item_title("".into());
+        window.set_selected_vault_item_fields(ModelRc::new(
+            VecModel::<crate::VaultItemFieldRow>::default(),
+        ));
+        window.set_selected_vault_item_empty_text("No vault items loaded.".into());
+        window.set_selected_has_password(false);
+        window.set_is_password_visible(false);
+    } else {
+        let is_pw_visible = password_visible_state
+            .lock()
+            .map(|mut s| {
+                *s = false;
+                false
+            })
+            .unwrap_or(false);
+        apply_selected_item(window, 0, &item_rows[0], is_pw_visible);
+    }
+
+    if let Ok(mut state) = tree_state.lock() {
+        *state = Some(collection_state);
+    }
+    if let Ok(mut items) = vault_item_state.lock() {
+        *items = item_rows;
+    }
+    if let Ok(mut visible_ref) = visible_item_indices.lock() {
+        *visible_ref = visible_indices;
+    }
+    window.set_is_vault_view(true);
+}
+
+fn schedule_tde_approval_poll(
+    weak_window: slint::Weak<crate::MainWindow>,
+    tde_pending_state: Arc<Mutex<Option<TdePendingState>>>,
+    tree_state: Arc<Mutex<Option<CollectionTreeState>>>,
+    vault_item_state: Arc<Mutex<Vec<VaultItemUiState>>>,
+    visible_item_indices_state: Arc<Mutex<Vec<usize>>>,
+    password_visible_state: Arc<Mutex<bool>>,
+) {
+    slint::Timer::single_shot(Duration::from_secs(10), move || {
+        // Only poll if there is a pending TDE state and the window still
+        // shows the approval-waiting view.
+        let pending_snapshot = {
+            if let Ok(guard) = tde_pending_state.lock() {
+                guard.clone()
+            } else {
+                None
+            }
+        };
+
+        if let Some(pending) = pending_snapshot {
+            // Do the network poll on a background thread to avoid blocking
+            // the Slint event loop.
+            let tde_pending_state_inner = tde_pending_state.clone();
+            let weak_for_poll = weak_window.clone();
+            let tree_state_poll = tree_state.clone();
+            let vault_item_state_poll = vault_item_state.clone();
+            let visible_item_indices_poll = visible_item_indices_state.clone();
+            let password_visible_state_poll = password_visible_state.clone();
+
+            thread::spawn(move || {
+                let poll_result = crate::auth::poll_auth_request_approval(&pending);
+
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(window) = weak_for_poll.upgrade() {
+                        // If the TDE view is no longer showing, do nothing
+                        if !window.get_is_tde_awaiting_approval() {
+                            return;
+                        }
+
+                        match poll_result {
+                            Ok(Some(encrypted_user_key)) => {
+                                // Approval received — complete the flow
+                                window
+                                    .set_status_text("Approval received! Decrypting vault…".into());
+                                window.set_status_is_error(false);
+
+                                let tde_pending_for_thread = tde_pending_state_inner.clone();
+                                let weak_for_complete = window.as_weak();
+                                let tree_state_c = tree_state_poll.clone();
+                                let vault_item_state_c = vault_item_state_poll.clone();
+                                let visible_item_indices_c = visible_item_indices_poll.clone();
+                                let password_visible_state_c = password_visible_state_poll.clone();
+
+                                thread::spawn(move || {
+                                    let pending_snap = {
+                                        tde_pending_for_thread
+                                            .lock()
+                                            .ok()
+                                            .and_then(|mut g| g.take())
+                                    };
+                                    let Some(pending) = pending_snap else {
+                                        return;
+                                    };
+
+                                    let result = crate::auth::complete_tde_after_approval(
+                                        &pending,
+                                        &encrypted_user_key,
+                                    );
+
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        if let Some(window) = weak_for_complete.upgrade() {
+                                            match result {
+                                                Ok(login_result) => {
+                                                    populate_vault_after_login(
+                                                        &window,
+                                                        login_result,
+                                                        "SSO login successful (device approved). Loaded {} collections and {} items.",
+                                                        &tree_state_c,
+                                                        &vault_item_state_c,
+                                                        &visible_item_indices_c,
+                                                        &password_visible_state_c,
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    window.set_status_is_error(true);
+                                                    window.set_status_text(e.into());
+                                                }
+                                            }
+                                        }
+                                    });
+                                });
+                            }
+                            Ok(None) => {
+                                // Not yet approved — reschedule
+                                schedule_tde_approval_poll(
+                                    weak_window,
+                                    tde_pending_state_inner,
+                                    tree_state_poll,
+                                    vault_item_state_poll,
+                                    visible_item_indices_poll,
+                                    password_visible_state_poll,
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("TDE poll error (will retry): {e}");
+                                schedule_tde_approval_poll(
+                                    weak_window,
+                                    tde_pending_state_inner,
+                                    tree_state_poll,
+                                    vault_item_state_poll,
+                                    visible_item_indices_poll,
+                                    password_visible_state_poll,
+                                );
+                            }
+                        }
+                    }
+                });
+            });
+        } else {
+            // No pending TDE state, but keep the timer alive in case SSO is
+            // triggered later in this session.
+            schedule_tde_approval_poll(
+                weak_window,
+                tde_pending_state,
+                tree_state,
+                vault_item_state,
+                visible_item_indices_state,
+                password_visible_state,
+            );
+        }
+    });
 }
 
 fn schedule_totp_refresh(

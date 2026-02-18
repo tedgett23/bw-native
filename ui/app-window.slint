@@ -28,6 +28,7 @@ export component MainWindow inherits Window {
     callback login-requested();
     callback sso-login-requested();
     callback sso-master-password-submitted();
+    callback tde-approval-cancel-requested();
     init => {
         Palette.color-scheme = ColorScheme.dark;
     }
@@ -53,6 +54,8 @@ export component MainWindow inherits Window {
     in-out property <string> sso-identifier;
     in-out property <bool> is-sso-awaiting-password;
     in-out property <string> sso-master-password;
+    in-out property <bool> is-tde-awaiting-approval;
+    in-out property <string> tde-fingerprint;
     in-out property <[CollectionTreeRow]> collection-tree-rows;
     in-out property <[VaultItemRow]> vault-item-rows;
     in-out property <string> search-query;
@@ -80,7 +83,7 @@ export component MainWindow inherits Window {
             border-width: 1px;
             border-color: root.color-border;
             border-radius: 10px;
-            visible: !root.is-vault-view && !root.is-sso-awaiting-password;
+            visible: !root.is-vault-view && !root.is-sso-awaiting-password && !root.is-tde-awaiting-approval;
 
             VerticalLayout {
                 padding-left: 24px;
@@ -203,7 +206,7 @@ export component MainWindow inherits Window {
             border-width: 1px;
             border-color: root.color-border;
             border-radius: 10px;
-            visible: root.is-sso-awaiting-password && !root.is-vault-view;
+            visible: root.is-sso-awaiting-password && !root.is-vault-view && !root.is-tde-awaiting-approval;
 
             VerticalLayout {
                 padding-left: 24px;
@@ -252,6 +255,96 @@ export component MainWindow inherits Window {
                     enabled: !root.is-logging-in;
                     clicked => {
                         root.sso-master-password-submitted();
+                    }
+                }
+            }
+        }
+
+        // ── TDE: waiting for device or admin approval ──────────────────────────
+        Rectangle {
+            width: parent.width > 700px ? 520px : parent.width - 80px;
+            height: 380px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: root.color-bg-panel;
+            border-width: 1px;
+            border-color: root.color-border;
+            border-radius: 10px;
+            visible: root.is-tde-awaiting-approval && !root.is-vault-view;
+
+            VerticalLayout {
+                padding-left: 24px;
+                padding-right: 24px;
+                padding-top: 20px;
+                padding-bottom: 20px;
+                spacing: 12px;
+
+                Text {
+                    text: "Approve from Another Device";
+                    color: root.color-text-primary;
+                    font-size: 20px;
+                    font-weight: 700;
+                }
+
+                Text {
+                    text: "A login approval request has been sent. Approve it from a trusted device or ask your organization admin to approve it in the admin console.";
+                    color: root.color-text-secondary;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: "Security Fingerprint";
+                    color: root.color-text-primary;
+                    font-size: 13px;
+                    font-weight: 600;
+                }
+
+                Rectangle {
+                    background: root.color-bg-elevated;
+                    border-width: 1px;
+                    border-color: root.color-border;
+                    border-radius: 6px;
+                    height: 48px;
+
+                    Text {
+                        text: root.tde-fingerprint != "" ? root.tde-fingerprint : "Generating…";
+                        color: root.color-success;
+                        font-size: 14px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                    }
+                }
+
+                Text {
+                    text: "Show this fingerprint to your approver to verify the request is legitimate.";
+                    color: root.color-text-muted;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: root.status-text;
+                    color: root.status-is-error ? root.color-error : root.color-text-secondary;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                    visible: root.status-text != "";
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        background: transparent;
+                    }
+
+                    Button {
+                        text: "Cancel";
+                        clicked => {
+                            root.tde-approval-cancel-requested();
+                        }
                     }
                 }
             }
