@@ -126,13 +126,10 @@ pub(super) struct CreateAuthRequest {
     pub(super) device_type: u32,
 }
 
-/// Request body for PUT /devices/identifier/{id}/trust.
+/// Request body for PUT /devices/{identifier}/keys.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "PascalCase")]
 pub(super) struct TrustDeviceRequest {
-    pub(super) name: String,
-    pub(super) identifier: String,
-    pub(super) r#type: u32,
     pub(super) encrypted_user_key: String,
     pub(super) encrypted_public_key: String,
     pub(super) encrypted_private_key: String,

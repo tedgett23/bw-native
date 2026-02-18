@@ -419,7 +419,7 @@ fn submit_auth_request(
         device_type: 8, // Linux desktop (same as token requests)
     };
 
-    let mut request = client.post(&url).json(&body);
+    let mut request = client.post(&url).header("Device-Type", "8").json(&body);
     if let Some(token) = access_token {
         request = request.bearer_auth(token);
     }
@@ -546,45 +546,45 @@ pub fn complete_tde_after_approval(
 fn register_device_trust(
     pending: &TdePendingState,
     user_key_arr: &[u8; 64],
-    ephemeral_private_key: &rsa::RsaPrivateKey,
+    _ephemeral_private_key: &rsa::RsaPrivateKey,
 ) -> Result<(), String> {
     // Generate a new permanent device key
-    let new_device = generate_device_key();
+    let new_device_key = generate_device_key();
 
-    // Encrypt the user key with the ephemeral RSA public key (for the server
-    // to echo back in future token responses' trustedDeviceOption)
-    let rsa_pub = rsa::RsaPublicKey::from(ephemeral_private_key);
+    // Generate a new permanent RSA keypair for this device (separate from the
+    // ephemeral keypair used during the auth-request flow).
+    let permanent_keypair = generate_ephemeral_keypair()?;
+
+    // Encrypt the user key with the permanent device public key
+    // (server returns this as encryptedUserKey in future trustedDeviceOption responses)
+    use rsa::pkcs8::EncodePublicKey;
+    let rsa_pub = rsa::RsaPublicKey::from(&permanent_keypair.private_key);
     let enc_user_key_b64 = rsa_encrypt(&rsa_pub, user_key_arr)?;
     let enc_user_key = format!("4.{enc_user_key_b64}");
 
-    // Encode ephemeral public key as Base64 DER
-    use rsa::pkcs8::EncodePublicKey;
+    // Encode the permanent public key as Base64 DER
     let pub_der = rsa_pub
         .to_public_key_der()
         .map_err(|e| format!("Failed to encode public key: {e}"))?;
 
-    // Encrypt the RSA private key with the new device key
-    let priv_der = private_key_to_der(ephemeral_private_key)?;
-    let enc_private_key = encrypt_with_device_key(&new_device.key, &priv_der)?;
+    // Encrypt the permanent RSA private key with the new device key
+    let priv_der = private_key_to_der(&permanent_keypair.private_key)?;
+    let enc_private_key = encrypt_with_device_key(&new_device_key.key, &priv_der)?;
 
-    // Encrypt the RSA public key with the user key
+    // Encrypt the permanent RSA public key with the user key
     let enc_public_key = encrypt_with_user_key_bytes(user_key_arr, pub_der.as_bytes())?;
 
-    let new_device_identifier = new_device.device_identifier.clone();
-
     let trust_request = TrustDeviceRequest {
-        name: "bw-native".to_string(),
-        identifier: new_device_identifier.clone(),
-        r#type: 8, // Linux desktop
         encrypted_user_key: enc_user_key,
         encrypted_public_key: enc_public_key,
         encrypted_private_key: enc_private_key,
     };
 
-    // The URL uses the new device's identifier, not the original SSO device identifier.
+    // The endpoint is PUT /devices/{identifier}/keys where identifier is the
+    // device identifier that was used in the original token request.
     let url = format!(
-        "{}/devices/identifier/{}/trust",
-        pending.api_base_url, new_device_identifier
+        "{}/devices/{}/keys",
+        pending.api_base_url, pending.device_identifier
     );
 
     let resp = pending
@@ -604,12 +604,13 @@ fn register_device_trust(
         ));
     }
 
-    // Persist the new device key locally
+    // Persist the device key using the same identifier that was registered
+    // with the server so the next login can find it.
     save_device_key(
         &pending.server_url,
         &StoredDeviceKey {
-            device_identifier: new_device.device_identifier,
-            key: new_device.key,
+            device_identifier: pending.device_identifier.clone(),
+            key: new_device_key.key,
         },
     )?;
 
