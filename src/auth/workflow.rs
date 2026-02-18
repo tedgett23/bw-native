@@ -11,7 +11,8 @@ use super::server::{normalize_email, resolve_api_base_url, resolve_identity_base
 use super::vault::{DecryptedVaultField, DecryptedVaultItem, sync_and_decrypt_vault};
 
 pub struct LoginResult {
-    pub collections: Vec<String>,
+    /// Each entry is `(collection_id, decrypted_name)`.
+    pub collections: Vec<(String, String)>,
     pub items: Vec<VaultItemView>,
 }
 

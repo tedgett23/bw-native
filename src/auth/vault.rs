@@ -33,7 +33,8 @@ struct CipherString {
 }
 
 pub(super) struct DecryptedVaultView {
-    pub(super) collections: Vec<String>,
+    /// Each entry is `(collection_id, decrypted_name)`.
+    pub(super) collections: Vec<(String, String)>,
     pub(super) items: Vec<DecryptedVaultItem>,
 }
 
@@ -714,7 +715,7 @@ fn build_vault_view(sync_json: &Value) -> DecryptedVaultView {
     }
 }
 
-fn build_collection_list(sync_json: &Value) -> Vec<String> {
+fn build_collection_list(sync_json: &Value) -> Vec<(String, String)> {
     let Some(collections) = sync_json.get("collections").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -722,13 +723,17 @@ fn build_collection_list(sync_json: &Value) -> Vec<String> {
     collections
         .iter()
         .filter_map(|collection| {
+            let id = collection
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())?;
             let name = collection
                 .get("name")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("Unnamed collection");
-            Some(name.to_string())
+            Some((id.to_string(), name.to_string()))
         })
         .collect()
 }

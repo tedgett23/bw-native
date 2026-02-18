@@ -81,15 +81,15 @@ fn has_password_field(fields: &[(String, String)]) -> bool {
 fn build_visible_item_indices(
     items: &[VaultItemUiState],
     raw_query: &str,
-    active_collection_id: Option<&str>,
+    active_uuids: Option<&HashSet<String>>,
 ) -> Vec<usize> {
     let query = raw_query.trim().to_lowercase();
     items
         .iter()
         .enumerate()
         .filter_map(|(index, item)| {
-            if let Some(col_id) = active_collection_id {
-                if !item.collection_ids.iter().any(|id| id == col_id) {
+            if let Some(uuids) = active_uuids {
+                if !item.collection_ids.iter().any(|id| uuids.contains(id)) {
                     return None;
                 }
             }
@@ -376,6 +376,8 @@ fn apply_selected_item(
 
 #[derive(Default)]
 struct TreeNode {
+    /// UUIDs of collections whose name path ends exactly at this node.
+    uuids: HashSet<String>,
     children: BTreeMap<String, TreeNode>,
 }
 
@@ -386,14 +388,15 @@ struct CollectionTreeState {
 }
 
 impl CollectionTreeState {
-    fn from_paths(paths: &[String]) -> Self {
+    fn from_collections(collections: &[(String, String)]) -> Self {
         let mut root = TreeNode::default();
 
-        for path in paths {
+        for (uuid, name_path) in collections {
             let mut node = &mut root;
-            for part in path.split('/').filter(|part| !part.is_empty()) {
+            for part in name_path.split('/').filter(|part| !part.is_empty()) {
                 node = node.children.entry(part.to_string()).or_default();
             }
+            node.uuids.insert(uuid.clone());
         }
 
         let mut expanded_nodes = HashSet::new();
@@ -427,6 +430,20 @@ impl CollectionTreeState {
         self.rebuild_rows();
     }
 
+    /// Collect all UUIDs reachable at or below the node identified by `name_path`.
+    fn collect_uuids_for_path(&self, name_path: &str) -> HashSet<String> {
+        let mut node = &self.root;
+        for part in name_path.split('/').filter(|p| !p.is_empty()) {
+            match node.children.get(part) {
+                Some(child) => node = child,
+                None => return HashSet::new(),
+            }
+        }
+        let mut uuids = HashSet::new();
+        collect_node_uuids(node, &mut uuids);
+        uuids
+    }
+
     fn to_model(&self) -> ModelRc<crate::CollectionTreeRow> {
         ModelRc::new(VecModel::from(self.visible_rows.clone()))
     }
@@ -435,6 +452,16 @@ impl CollectionTreeState {
         let mut rows = Vec::new();
         flatten_tree(&self.root, "", 0, &self.expanded_nodes, &mut rows);
         self.visible_rows = rows;
+    }
+}
+
+/// Recursively collect all UUIDs in a subtree.
+fn collect_node_uuids(node: &TreeNode, out: &mut HashSet<String>) {
+    for uuid in &node.uuids {
+        out.insert(uuid.clone());
+    }
+    for child in node.children.values() {
+        collect_node_uuids(child, out);
     }
 }
 
@@ -523,27 +550,35 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
             let Some(row) = row else { return };
 
             if row.has_children {
+                // Parent node: toggle expand/collapse.
                 state.toggle_row(row_index);
                 window.set_collection_tree_rows(state.to_model());
-            } else {
-                // Leaf node — select it as the active collection filter.
-                let collection_id = row.id.to_string();
+            }
 
-                // Toggle: clicking the already-selected collection deselects it.
+            {
+                // Any node (parent or leaf): toggle as active collection filter.
+                let node_path = row.id.to_string();
+
+                // Toggle: clicking the already-selected node deselects it.
                 let new_active = {
                     let Ok(mut active_ref) = active_collection_id.lock() else {
                         return;
                     };
-                    if active_ref.as_deref() == Some(&collection_id) {
+                    if active_ref.as_deref() == Some(&node_path) {
                         *active_ref = None;
                         None
                     } else {
-                        *active_ref = Some(collection_id.clone());
-                        Some(collection_id)
+                        *active_ref = Some(node_path.clone());
+                        Some(node_path)
                     }
                 };
 
                 window.set_active_collection_id(new_active.as_deref().unwrap_or("").into());
+
+                // Resolve UUIDs for the selected node and all its descendants.
+                let active_uuids = new_active
+                    .as_deref()
+                    .map(|path| state.collect_uuids_for_path(path));
 
                 // Refilter items using both search query and new collection filter.
                 let search_query = window.get_search_query().to_string();
@@ -551,7 +586,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                     return;
                 };
                 let next_indices =
-                    build_visible_item_indices(&items_ref, &search_query, new_active.as_deref());
+                    build_visible_item_indices(&items_ref, &search_query, active_uuids.as_ref());
                 window.set_vault_item_rows(model_from_item_rows(&items_ref, &next_indices));
 
                 if let Ok(mut visible_ref) = visible_item_indices_state.lock() {
@@ -719,6 +754,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
 
     {
         let weak_window = weak_window.clone();
+        let tree_state = tree_state.clone();
         let vault_item_state = vault_item_state.clone();
         let visible_item_indices_state = visible_item_indices_state.clone();
         let password_visible_state = password_visible_state.clone();
@@ -747,9 +783,15 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                 return;
             };
 
-            let active_col = active_collection_id.lock().ok().and_then(|g| g.clone());
+            let active_col_path = active_collection_id.lock().ok().and_then(|g| g.clone());
+            let active_uuids = active_col_path.as_deref().and_then(|path| {
+                tree_state
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|s| s.collect_uuids_for_path(path)))
+            });
             let next_visible_indices =
-                build_visible_item_indices(&items_ref, &search_query, active_col.as_deref());
+                build_visible_item_indices(&items_ref, &search_query, active_uuids.as_ref());
             window.set_vault_item_rows(model_from_item_rows(&items_ref, &next_visible_indices));
 
             if let Ok(mut visible_indices_ref) = visible_item_indices_state.lock() {
@@ -874,7 +916,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                             );
                             window.set_password("".into());
                             let collection_state =
-                                CollectionTreeState::from_paths(&result.collections);
+                                CollectionTreeState::from_collections(&result.collections);
                             window.set_collection_tree_rows(collection_state.to_model());
                             let item_rows: Vec<VaultItemUiState> = result
                                 .items
@@ -1147,7 +1189,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                                 }
 
                                 let collection_state =
-                                    CollectionTreeState::from_paths(&result.collections);
+                                    CollectionTreeState::from_collections(&result.collections);
                                 window.set_collection_tree_rows(collection_state.to_model());
 
                                 let item_rows: Vec<VaultItemUiState> = result
@@ -1267,7 +1309,7 @@ fn populate_vault_after_login(
         *active_col = None;
     }
 
-    let collection_state = CollectionTreeState::from_paths(&result.collections);
+    let collection_state = CollectionTreeState::from_collections(&result.collections);
     window.set_collection_tree_rows(collection_state.to_model());
 
     let item_rows: Vec<VaultItemUiState> = result
