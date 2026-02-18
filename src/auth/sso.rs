@@ -31,10 +31,10 @@ const SSO_PORT_START: u16 = 8065;
 const SSO_PORT_END: u16 = 8070;
 const SSO_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Auth-request type 1 = device approval ("AuthenticateAndUnlock").
-const AUTH_REQUEST_TYPE_DEVICE: u32 = 1;
-/// Auth-request type 7 = admin-console approval.
-const AUTH_REQUEST_TYPE_ADMIN: u32 = 7;
+/// Auth-request type 0 = AuthenticateAndUnlock (standard device-to-device approval).
+const AUTH_REQUEST_TYPE_DEVICE: u32 = 0;
+/// Auth-request type 2 = AdminApproval (org admin approves via admin console).
+const AUTH_REQUEST_TYPE_ADMIN: u32 = 2;
 
 // ── Public result types ───────────────────────────────────────────────────────
 
@@ -69,6 +69,7 @@ pub enum SsoTokenResult {
 pub struct TdePendingState {
     pub access_token: String,
     pub api_base_url: String,
+    #[allow(dead_code)]
     pub identity_base_url: String,
     pub server_url: String,
     #[allow(dead_code)]
@@ -76,8 +77,14 @@ pub struct TdePendingState {
     #[allow(dead_code)]
     pub kdf_config: KdfConfigSnapshot,
     pub client: Client,
-    /// Auth-request IDs to poll (device-approval and/or admin-approval).
-    pub auth_request_ids: Vec<String>,
+    /// Auth-request IDs to poll, paired with whether each needs bearer auth for polling.
+    /// Tuple: (request_id, needs_bearer_auth)
+    /// - Device approval (type 0): poll unauthenticated with ?code=
+    /// - Admin approval (type 2): poll authenticated with bearer token
+    pub auth_requests: Vec<(String, bool)>,
+    /// The 25-char access code used when creating the device-approval request.
+    /// Required for unauthenticated polling of that request.
+    pub access_code: String,
     /// The ephemeral RSA private key whose public key the approver used to
     /// encrypt the user key.
     pub ephemeral_private_key_der: Vec<u8>,
@@ -280,27 +287,41 @@ pub fn try_sso_login(
     let fingerprint = fingerprint_phrase(email, &keypair.public_key_b64);
     let access_code = generate_access_code();
 
-    let mut auth_request_ids = Vec::new();
+    let mut auth_requests: Vec<(String, bool)> = Vec::new();
 
-    // Try both auth-request types so either another device *or* an admin can approve.
-    for request_type in [AUTH_REQUEST_TYPE_DEVICE, AUTH_REQUEST_TYPE_ADMIN] {
-        match submit_auth_request(
-            &client,
-            &identity_base_url,
-            &access_token,
-            email,
-            &keypair.public_key_b64,
-            &device_identifier,
-            &access_code,
-            &fingerprint,
-            request_type,
-        ) {
-            Ok(resp) => auth_request_ids.push(resp.id),
-            Err(e) => eprintln!("Auth request (type {request_type}) failed: {e}"),
-        }
+    // Device approval (type 0): POST /auth-requests/ on the API server — unauthenticated.
+    // Polling uses GET /auth-requests/{id}/response?code={access_code} (no bearer token).
+    match submit_auth_request(
+        &client,
+        &api_base_url,
+        None, // no bearer token
+        email,
+        &keypair.public_key_b64,
+        &device_identifier,
+        &access_code,
+        AUTH_REQUEST_TYPE_DEVICE,
+    ) {
+        Ok(resp) => auth_requests.push((resp.id, false)), // false = poll without bearer
+        Err(e) => eprintln!("Device auth request (type 0) failed: {e}"),
     }
 
-    if auth_request_ids.is_empty() {
+    // Admin approval (type 2): POST /auth-requests/admin-request on the API server — authenticated.
+    // Polling uses GET /auth-requests/{id} with bearer token.
+    match submit_auth_request(
+        &client,
+        &api_base_url,
+        Some(&access_token), // bearer token required
+        email,
+        &keypair.public_key_b64,
+        &device_identifier,
+        &access_code,
+        AUTH_REQUEST_TYPE_ADMIN,
+    ) {
+        Ok(resp) => auth_requests.push((resp.id, true)), // true = poll with bearer
+        Err(e) => eprintln!("Admin auth request (type 2) failed: {e}"),
+    }
+
+    if auth_requests.is_empty() {
         return Err("Could not submit auth approval request. \
              Check that your account has admin-approval or device-approval enabled."
             .to_string());
@@ -317,7 +338,8 @@ pub fn try_sso_login(
             email: email.to_string(),
             kdf_config,
             client,
-            auth_request_ids,
+            auth_requests,
+            access_code,
             ephemeral_private_key_der,
             device_identifier,
         },
@@ -371,19 +393,20 @@ fn try_trusted_device_decrypt(
 
 fn submit_auth_request(
     client: &Client,
-    identity_base_url: &str,
-    access_token: &str,
+    api_base_url: &str,
+    access_token: Option<&str>,
     email: &str,
     public_key_b64: &str,
     device_identifier: &str,
     access_code: &str,
-    fingerprint: &str,
     request_type: u32,
 ) -> Result<AuthRequestResponse, String> {
+    // Admin approval goes to /auth-requests/admin-request (requires bearer token).
+    // Device approval goes to /auth-requests/ (unauthenticated).
     let url = if request_type == AUTH_REQUEST_TYPE_ADMIN {
-        format!("{identity_base_url}/auth-requests/admin-request")
+        format!("{api_base_url}/auth-requests/admin-request")
     } else {
-        format!("{identity_base_url}/auth-requests")
+        format!("{api_base_url}/auth-requests")
     };
 
     let body = CreateAuthRequest {
@@ -392,13 +415,13 @@ fn submit_auth_request(
         device_identifier: device_identifier.to_string(),
         access_code: access_code.to_string(),
         r#type: request_type,
-        finger_print: fingerprint.to_string(),
     };
 
-    let resp = client
-        .post(&url)
-        .bearer_auth(access_token)
-        .json(&body)
+    let mut request = client.post(&url).json(&body);
+    if let Some(token) = access_token {
+        request = request.bearer_auth(token);
+    }
+    let resp = request
         .send()
         .map_err(|e| format!("Auth request failed: {e}"))?;
 
@@ -414,22 +437,30 @@ fn submit_auth_request(
     from_str(&text).map_err(|e| format!("Invalid auth request response: {e}"))
 }
 
-/// Poll all pending auth-request IDs once and return the first approved
-/// encrypted user key found, along with the approving request's ID.
+/// Poll all pending auth requests once and return the first approved encrypted
+/// user key found.
+///
+/// - Device approval (needs_bearer=false): GET /auth-requests/{id}/response?code={access_code}
+/// - Admin approval (needs_bearer=true):   GET /auth-requests/{id}  (bearer token)
 pub fn poll_auth_request_approval(pending: &TdePendingState) -> Result<Option<String>, String> {
-    for request_id in &pending.auth_request_ids {
-        let url = format!(
-            "{}/auth-requests/{}/response",
-            pending.identity_base_url, request_id
-        );
+    for (request_id, needs_bearer) in &pending.auth_requests {
+        let url = if *needs_bearer {
+            // Admin approval — authenticated endpoint, no query params
+            format!("{}/auth-requests/{}", pending.api_base_url, request_id)
+        } else {
+            // Device approval — unauthenticated, access code as query param
+            format!(
+                "{}/auth-requests/{}/response?code={}",
+                pending.api_base_url, request_id, pending.access_code
+            )
+        };
 
-        let resp = pending
-            .client
-            .get(&url)
-            .bearer_auth(&pending.access_token)
-            .send();
+        let mut req = pending.client.get(&url);
+        if *needs_bearer {
+            req = req.bearer_auth(&pending.access_token);
+        }
 
-        let resp = match resp {
+        let resp = match req.send() {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Auth request poll failed for {request_id}: {e}");
@@ -441,8 +472,8 @@ pub fn poll_auth_request_approval(pending: &TdePendingState) -> Result<Option<St
         let text = resp.text().unwrap_or_default();
 
         if !status.is_success() {
-            // 404 means not yet answered — normal during polling
-            if status.as_u16() != 404 {
+            // 404 / 204 = not yet answered — normal during polling
+            if status.as_u16() != 404 && status.as_u16() != 204 {
                 eprintln!("Auth request poll {request_id} returned {status}: {text}");
             }
             continue;

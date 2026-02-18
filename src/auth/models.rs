@@ -114,7 +114,7 @@ pub(super) struct AuthRequestApprovalResponse {
     pub(super) request_approved: Option<bool>,
 }
 
-/// Request body for POST /auth-requests.
+/// Request body for POST /auth-requests and POST /auth-requests/admin-request.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct CreateAuthRequest {
@@ -123,7 +123,6 @@ pub(super) struct CreateAuthRequest {
     pub(super) device_identifier: String,
     pub(super) access_code: String,
     pub(super) r#type: u32,
-    pub(super) finger_print: String,
 }
 
 /// Request body for PUT /devices/identifier/{id}/trust.
