@@ -89,6 +89,7 @@ pub struct TdePendingState {
     /// encrypt the user key.
     pub ephemeral_private_key_der: Vec<u8>,
     /// Device identifier sent with the token request (needed for trust setup).
+    #[allow(dead_code)]
     pub device_identifier: String,
 }
 
@@ -415,6 +416,7 @@ fn submit_auth_request(
         device_identifier: device_identifier.to_string(),
         access_code: access_code.to_string(),
         r#type: request_type,
+        device_type: 8, // Linux desktop (same as token requests)
     };
 
     let mut request = client.post(&url).json(&body);
@@ -568,18 +570,21 @@ fn register_device_trust(
     // Encrypt the RSA public key with the user key
     let enc_public_key = encrypt_with_user_key_bytes(user_key_arr, pub_der.as_bytes())?;
 
+    let new_device_identifier = new_device.device_identifier.clone();
+
     let trust_request = TrustDeviceRequest {
         name: "bw-native".to_string(),
-        identifier: new_device.device_identifier.clone(),
+        identifier: new_device_identifier.clone(),
         r#type: 8, // Linux desktop
         encrypted_user_key: enc_user_key,
         encrypted_public_key: enc_public_key,
         encrypted_private_key: enc_private_key,
     };
 
+    // The URL uses the new device's identifier, not the original SSO device identifier.
     let url = format!(
         "{}/devices/identifier/{}/trust",
-        pending.api_base_url, pending.device_identifier
+        pending.api_base_url, new_device_identifier
     );
 
     let resp = pending

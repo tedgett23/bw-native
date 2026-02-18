@@ -123,6 +123,7 @@ pub(super) struct CreateAuthRequest {
     pub(super) device_identifier: String,
     pub(super) access_code: String,
     pub(super) r#type: u32,
+    pub(super) device_type: u32,
 }
 
 /// Request body for PUT /devices/identifier/{id}/trust.
