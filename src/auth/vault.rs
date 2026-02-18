@@ -40,6 +40,7 @@ pub(super) struct DecryptedVaultView {
 pub(super) struct DecryptedVaultItem {
     pub(super) label: String,
     pub(super) fields: Vec<DecryptedVaultField>,
+    pub(super) collection_ids: Vec<String>,
 }
 
 pub(super) struct DecryptedVaultField {
@@ -747,9 +748,20 @@ fn build_item_list(sync_json: &Value) -> Vec<DecryptedVaultItem> {
                 .filter(|value| !value.is_empty())
                 .unwrap_or("Unnamed item");
 
+            let collection_ids = cipher
+                .get("collectionIds")
+                .and_then(Value::as_array)
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| id.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             DecryptedVaultItem {
                 label: name.to_string(),
                 fields: build_item_fields(cipher),
+                collection_ids,
             }
         })
         .collect()

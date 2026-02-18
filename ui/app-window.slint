@@ -57,6 +57,7 @@ export component MainWindow inherits Window {
     in-out property <bool> is-tde-awaiting-approval;
     in-out property <string> tde-fingerprint;
     in-out property <[CollectionTreeRow]> collection-tree-rows;
+    in-out property <string> active-collection-id;
     in-out property <[VaultItemRow]> vault-item-rows;
     in-out property <string> search-query;
     in-out property <bool> has-active-search;
@@ -67,6 +68,7 @@ export component MainWindow inherits Window {
     in-out property <bool> selected-has-password;
     in-out property <bool> is-password-visible;
     callback collection-tree-row-clicked(int);
+    callback collection-all-items-clicked();
     callback vault-item-clicked(int);
     callback search-requested();
     callback toggle-password-visibility();
@@ -400,11 +402,34 @@ export component MainWindow inherits Window {
                                 font-weight: 700;
                             }
 
+                            // "All Items" — clears any active collection filter
+                            Rectangle {
+                                height: 28px;
+                                background: root.active-collection-id == "" ? root.color-accent-soft : transparent;
+                                border-radius: 4px;
+
+                                Text {
+                                    text: "All Items";
+                                    color: root.active-collection-id == "" ? root.color-text-primary : root.color-text-secondary;
+                                    font-size: 13px;
+                                    font-weight: root.active-collection-id == "" ? 600 : 400;
+                                    vertical-alignment: center;
+                                    x: 4px;
+                                }
+
+                                TouchArea {
+                                    clicked => {
+                                        root.collection-all-items-clicked();
+                                    }
+                                }
+                            }
+
                             ListView {
                                 vertical-stretch: 1;
                                 for row[index] in root.collection-tree-rows: Rectangle {
                                     height: 28px;
-                                    background: transparent;
+                                    background: !row.has-children && root.active-collection-id == row.id ? root.color-accent-soft : transparent;
+                                    border-radius: 4px;
 
                                     HorizontalLayout {
                                         spacing: 4px;
@@ -424,8 +449,9 @@ export component MainWindow inherits Window {
 
                                         Text {
                                             text: row.label;
-                                            color: root.color-text-secondary;
+                                            color: !row.has-children && root.active-collection-id == row.id ? root.color-text-primary : root.color-text-secondary;
                                             font-size: 13px;
+                                            font-weight: !row.has-children && root.active-collection-id == row.id ? 600 : 400;
                                             vertical-alignment: center;
                                         }
                                     }

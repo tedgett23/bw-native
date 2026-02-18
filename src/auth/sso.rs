@@ -678,6 +678,7 @@ fn build_login_result(vault_view: super::vault::DecryptedVaultView) -> LoginResu
                         value: f.value,
                     })
                     .collect(),
+                collection_ids: item.collection_ids,
             })
             .collect(),
     }

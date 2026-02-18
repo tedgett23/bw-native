@@ -18,6 +18,7 @@ pub struct LoginResult {
 pub struct VaultItemView {
     pub label: String,
     pub fields: Vec<VaultItemFieldView>,
+    pub collection_ids: Vec<String>,
 }
 
 pub struct VaultItemFieldView {
@@ -134,6 +135,7 @@ fn map_item_view(item: DecryptedVaultItem) -> VaultItemView {
     VaultItemView {
         label: item.label,
         fields: item.fields.into_iter().map(map_item_field_view).collect(),
+        collection_ids: item.collection_ids,
     }
 }
 

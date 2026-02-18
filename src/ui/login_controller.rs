@@ -27,6 +27,7 @@ struct SsoPendingState {
 struct VaultItemUiState {
     label: String,
     fields: Vec<(String, String)>,
+    collection_ids: Vec<String>,
 }
 
 fn model_from_item_rows(
@@ -77,12 +78,23 @@ fn has_password_field(fields: &[(String, String)]) -> bool {
     fields.iter().any(|(label, _)| is_password_label(label))
 }
 
-fn build_visible_item_indices(items: &[VaultItemUiState], raw_query: &str) -> Vec<usize> {
+fn build_visible_item_indices(
+    items: &[VaultItemUiState],
+    raw_query: &str,
+    active_collection_id: Option<&str>,
+) -> Vec<usize> {
     let query = raw_query.trim().to_lowercase();
     items
         .iter()
         .enumerate()
-        .filter_map(|(index, item)| item_matches_query(item, &query).then_some(index))
+        .filter_map(|(index, item)| {
+            if let Some(col_id) = active_collection_id {
+                if !item.collection_ids.iter().any(|id| id == col_id) {
+                    return None;
+                }
+            }
+            item_matches_query(item, &query).then_some(index)
+        })
         .collect()
 }
 
@@ -478,10 +490,16 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
     let vault_item_state = Arc::new(Mutex::new(Vec::<VaultItemUiState>::new()));
     let visible_item_indices_state = Arc::new(Mutex::new(Vec::<usize>::new()));
     let password_visible_state = Arc::new(Mutex::new(false));
+    // None means "All Items"; Some(id) means filter to that collection's items.
+    let active_collection_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     {
         let weak_window = weak_window.clone();
         let tree_state = tree_state.clone();
+        let vault_item_state = vault_item_state.clone();
+        let visible_item_indices_state = visible_item_indices_state.clone();
+        let password_visible_state = password_visible_state.clone();
+        let active_collection_id = active_collection_id.clone();
 
         window.on_collection_tree_row_clicked(move |row_index| {
             let Some(window) = weak_window.upgrade() else {
@@ -499,8 +517,116 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                 return;
             };
 
-            state.toggle_row(row_index);
-            window.set_collection_tree_rows(state.to_model());
+            // For parent nodes: toggle expand/collapse.
+            // For leaf nodes: select the collection as the active filter.
+            let row = state.visible_rows.get(row_index).cloned();
+            let Some(row) = row else { return };
+
+            if row.has_children {
+                state.toggle_row(row_index);
+                window.set_collection_tree_rows(state.to_model());
+            } else {
+                // Leaf node — select it as the active collection filter.
+                let collection_id = row.id.to_string();
+
+                // Toggle: clicking the already-selected collection deselects it.
+                let new_active = {
+                    let Ok(mut active_ref) = active_collection_id.lock() else {
+                        return;
+                    };
+                    if active_ref.as_deref() == Some(&collection_id) {
+                        *active_ref = None;
+                        None
+                    } else {
+                        *active_ref = Some(collection_id.clone());
+                        Some(collection_id)
+                    }
+                };
+
+                window.set_active_collection_id(new_active.as_deref().unwrap_or("").into());
+
+                // Refilter items using both search query and new collection filter.
+                let search_query = window.get_search_query().to_string();
+                let Ok(items_ref) = vault_item_state.lock() else {
+                    return;
+                };
+                let next_indices =
+                    build_visible_item_indices(&items_ref, &search_query, new_active.as_deref());
+                window.set_vault_item_rows(model_from_item_rows(&items_ref, &next_indices));
+
+                if let Ok(mut visible_ref) = visible_item_indices_state.lock() {
+                    *visible_ref = next_indices.clone();
+                }
+
+                if let Ok(mut pw) = password_visible_state.lock() {
+                    *pw = false;
+                }
+                window.set_is_password_visible(false);
+
+                if next_indices.is_empty() {
+                    window.set_selected_vault_item_index(-1);
+                    window.set_selected_vault_item_title("".into());
+                    window.set_selected_vault_item_fields(ModelRc::new(VecModel::<
+                        crate::VaultItemFieldRow,
+                    >::default(
+                    )));
+                    window.set_selected_vault_item_empty_text(
+                        "No vault items in this collection.".into(),
+                    );
+                    window.set_selected_has_password(false);
+                } else if let Some(item) = items_ref.get(next_indices[0]) {
+                    apply_selected_item(&window, 0, item, false);
+                }
+            }
+        });
+    }
+
+    {
+        let weak_window = weak_window.clone();
+        let vault_item_state = vault_item_state.clone();
+        let visible_item_indices_state = visible_item_indices_state.clone();
+        let password_visible_state = password_visible_state.clone();
+        let active_collection_id = active_collection_id.clone();
+
+        window.on_collection_all_items_clicked(move || {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+
+            // Clear the collection filter
+            if let Ok(mut active_ref) = active_collection_id.lock() {
+                *active_ref = None;
+            }
+            window.set_active_collection_id("".into());
+
+            // Rebuild visible items with no collection filter
+            let search_query = window.get_search_query().to_string();
+            let Ok(items_ref) = vault_item_state.lock() else {
+                return;
+            };
+            let next_indices = build_visible_item_indices(&items_ref, &search_query, None);
+            window.set_vault_item_rows(model_from_item_rows(&items_ref, &next_indices));
+
+            if let Ok(mut visible_ref) = visible_item_indices_state.lock() {
+                *visible_ref = next_indices.clone();
+            }
+
+            if let Ok(mut pw) = password_visible_state.lock() {
+                *pw = false;
+            }
+            window.set_is_password_visible(false);
+
+            if next_indices.is_empty() {
+                window.set_selected_vault_item_index(-1);
+                window.set_selected_vault_item_title("".into());
+                window.set_selected_vault_item_fields(ModelRc::new(VecModel::<
+                    crate::VaultItemFieldRow,
+                >::default()));
+                window.set_selected_vault_item_empty_text("No vault items loaded.".into());
+                window.set_selected_has_password(false);
+            } else if let Some(item) = items_ref.get(next_indices[0]) {
+                apply_selected_item(&window, 0, item, false);
+            }
         });
     }
 
@@ -596,6 +722,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         let vault_item_state = vault_item_state.clone();
         let visible_item_indices_state = visible_item_indices_state.clone();
         let password_visible_state = password_visible_state.clone();
+        let active_collection_id = active_collection_id.clone();
 
         window.on_search_requested(move || {
             let Some(window) = weak_window.upgrade() else {
@@ -620,7 +747,9 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                 return;
             };
 
-            let next_visible_indices = build_visible_item_indices(&items_ref, &search_query);
+            let active_col = active_collection_id.lock().ok().and_then(|g| g.clone());
+            let next_visible_indices =
+                build_visible_item_indices(&items_ref, &search_query, active_col.as_deref());
             window.set_vault_item_rows(model_from_item_rows(&items_ref, &next_visible_indices));
 
             if let Ok(mut visible_indices_ref) = visible_item_indices_state.lock() {
@@ -672,6 +801,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
     let vault_item_state_for_login = vault_item_state.clone();
     let visible_item_indices_for_login = visible_item_indices_state.clone();
     let password_visible_state_for_login = password_visible_state.clone();
+    let active_collection_id_for_login = active_collection_id.clone();
     window.on_login_requested(move || {
         let Some(window) = weak_window_for_login.upgrade() else {
             return;
@@ -703,6 +833,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         window.set_selected_vault_item_empty_text("Select an item to view details.".into());
         window.set_selected_has_password(false);
         window.set_is_password_visible(false);
+        window.set_active_collection_id("".into());
         if let Ok(mut state) = tree_state_for_login.lock() {
             *state = None;
         }
@@ -714,6 +845,9 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         }
         if let Ok(mut visible_state) = password_visible_state_for_login.lock() {
             *visible_state = false;
+        }
+        if let Ok(mut active_col) = active_collection_id_for_login.lock() {
+            *active_col = None;
         }
 
         let weak_for_thread = weak_window_for_login.clone();
@@ -752,6 +886,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                                         .into_iter()
                                         .map(|field| (field.label, field.value))
                                         .collect(),
+                                    collection_ids: item.collection_ids,
                                 })
                                 .collect();
                             let visible_indices: Vec<usize> = (0..item_rows.len()).collect();
@@ -811,6 +946,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         let vault_item_state = vault_item_state.clone();
         let visible_item_indices_state = visible_item_indices_state.clone();
         let password_visible_state = password_visible_state.clone();
+        let active_collection_id = active_collection_id.clone();
 
         window.on_sso_login_requested(move || {
             let Some(window) = weak_window.upgrade() else {
@@ -836,6 +972,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
             let vault_item_state = vault_item_state.clone();
             let visible_item_indices = visible_item_indices_state.clone();
             let password_visible_state = password_visible_state.clone();
+            let active_collection_id = active_collection_id.clone();
             thread::spawn(move || {
                 let result = crate::auth::try_sso_login(&server_url, &org_identifier, &email);
 
@@ -875,6 +1012,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                                     &vault_item_state,
                                     &visible_item_indices,
                                     &password_visible_state,
+                                    &active_collection_id,
                                 );
                             }
                             Ok(crate::auth::SsoTokenResult::NeedsDeviceApproval {
@@ -932,6 +1070,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         let vault_item_state = vault_item_state.clone();
         let visible_item_indices_state = visible_item_indices_state.clone();
         let password_visible_state = password_visible_state.clone();
+        let active_collection_id = active_collection_id.clone();
 
         window.on_sso_master_password_submitted(move || {
             let Some(window) = weak_window.upgrade() else {
@@ -974,6 +1113,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
             let vault_item_state = vault_item_state.clone();
             let visible_item_indices = visible_item_indices_state.clone();
             let password_visible_state = password_visible_state.clone();
+            let active_collection_id = active_collection_id.clone();
             thread::spawn(move || {
                 let result = crate::auth::complete_sso_with_master_password(
                     &pending.client,
@@ -1001,6 +1141,10 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                                 );
                                 window.set_sso_master_password("".into());
                                 window.set_is_sso_awaiting_password(false);
+                                window.set_active_collection_id("".into());
+                                if let Ok(mut active_col) = active_collection_id.lock() {
+                                    *active_col = None;
+                                }
 
                                 let collection_state =
                                     CollectionTreeState::from_paths(&result.collections);
@@ -1016,6 +1160,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                                             .into_iter()
                                             .map(|field| (field.label, field.value))
                                             .collect(),
+                                        collection_ids: item.collection_ids,
                                     })
                                     .collect();
 
@@ -1088,6 +1233,7 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         vault_item_state.clone(),
         visible_item_indices_state.clone(),
         password_visible_state.clone(),
+        active_collection_id.clone(),
     );
 }
 
@@ -1101,6 +1247,7 @@ fn populate_vault_after_login(
     vault_item_state: &Arc<Mutex<Vec<VaultItemUiState>>>,
     visible_item_indices: &Arc<Mutex<Vec<usize>>>,
     password_visible_state: &Arc<Mutex<bool>>,
+    active_collection_id: &Arc<Mutex<Option<String>>>,
 ) {
     window.set_status_is_error(false);
     window.set_status_text(
@@ -1115,6 +1262,10 @@ fn populate_vault_after_login(
     window.set_tde_fingerprint("".into());
     window.set_search_query("".into());
     window.set_has_active_search(false);
+    window.set_active_collection_id("".into());
+    if let Ok(mut active_col) = active_collection_id.lock() {
+        *active_col = None;
+    }
 
     let collection_state = CollectionTreeState::from_paths(&result.collections);
     window.set_collection_tree_rows(collection_state.to_model());
@@ -1129,6 +1280,7 @@ fn populate_vault_after_login(
                 .into_iter()
                 .map(|field| (field.label, field.value))
                 .collect(),
+            collection_ids: item.collection_ids,
         })
         .collect();
 
@@ -1174,6 +1326,7 @@ fn schedule_tde_approval_poll(
     vault_item_state: Arc<Mutex<Vec<VaultItemUiState>>>,
     visible_item_indices_state: Arc<Mutex<Vec<usize>>>,
     password_visible_state: Arc<Mutex<bool>>,
+    active_collection_id: Arc<Mutex<Option<String>>>,
 ) {
     slint::Timer::single_shot(Duration::from_secs(10), move || {
         // Only poll if there is a pending TDE state and the window still
@@ -1195,6 +1348,7 @@ fn schedule_tde_approval_poll(
             let vault_item_state_poll = vault_item_state.clone();
             let visible_item_indices_poll = visible_item_indices_state.clone();
             let password_visible_state_poll = password_visible_state.clone();
+            let active_collection_id_poll = active_collection_id.clone();
 
             thread::spawn(move || {
                 let poll_result = crate::auth::poll_auth_request_approval(&pending);
@@ -1219,6 +1373,7 @@ fn schedule_tde_approval_poll(
                                 let vault_item_state_c = vault_item_state_poll.clone();
                                 let visible_item_indices_c = visible_item_indices_poll.clone();
                                 let password_visible_state_c = password_visible_state_poll.clone();
+                                let active_collection_id_c = active_collection_id_poll.clone();
 
                                 thread::spawn(move || {
                                     let pending_snap = {
@@ -1248,6 +1403,7 @@ fn schedule_tde_approval_poll(
                                                         &vault_item_state_c,
                                                         &visible_item_indices_c,
                                                         &password_visible_state_c,
+                                                        &active_collection_id_c,
                                                     );
                                                 }
                                                 Err(e) => {
@@ -1268,6 +1424,7 @@ fn schedule_tde_approval_poll(
                                     vault_item_state_poll,
                                     visible_item_indices_poll,
                                     password_visible_state_poll,
+                                    active_collection_id_poll,
                                 );
                             }
                             Err(e) => {
@@ -1279,6 +1436,7 @@ fn schedule_tde_approval_poll(
                                     vault_item_state_poll,
                                     visible_item_indices_poll,
                                     password_visible_state_poll,
+                                    active_collection_id_poll,
                                 );
                             }
                         }
@@ -1295,6 +1453,7 @@ fn schedule_tde_approval_poll(
                 vault_item_state,
                 visible_item_indices_state,
                 password_visible_state,
+                active_collection_id,
             );
         }
     });
@@ -1385,22 +1544,27 @@ mod tests {
                     ("Login / Totp".to_string(), "JBSWY3DPEHPK3PXP".to_string()),
                     ("Login / Notes".to_string(), "prod account".to_string()),
                 ],
+                collection_ids: vec![],
             },
             VaultItemUiState {
                 label: "Dev".to_string(),
                 fields: vec![("Custom / Team".to_string(), "platform".to_string())],
+                collection_ids: vec![],
             },
         ];
 
-        assert_eq!(build_visible_item_indices(&items, "alice"), vec![0]);
-        assert_eq!(build_visible_item_indices(&items, "prod"), vec![0]);
-        assert_eq!(build_visible_item_indices(&items, "platform"), vec![1]);
+        assert_eq!(build_visible_item_indices(&items, "alice", None), vec![0]);
+        assert_eq!(build_visible_item_indices(&items, "prod", None), vec![0]);
         assert_eq!(
-            build_visible_item_indices(&items, "secret-password"),
+            build_visible_item_indices(&items, "platform", None),
+            vec![1]
+        );
+        assert_eq!(
+            build_visible_item_indices(&items, "secret-password", None),
             Vec::<usize>::new()
         );
         assert_eq!(
-            build_visible_item_indices(&items, "JBSWY3DPEHPK3PXP"),
+            build_visible_item_indices(&items, "JBSWY3DPEHPK3PXP", None),
             Vec::<usize>::new()
         );
     }
