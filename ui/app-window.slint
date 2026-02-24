@@ -58,6 +58,8 @@ export component MainWindow inherits Window {
     in-out property <string> tde-fingerprint;
     in-out property <[CollectionTreeRow]> collection-tree-rows;
     in-out property <string> active-collection-id;
+    in-out property <string> collection-search-query;
+    in-out property <bool> has-active-collection-search;
     in-out property <[VaultItemRow]> vault-item-rows;
     in-out property <string> search-query;
     in-out property <bool> has-active-search;
@@ -70,6 +72,7 @@ export component MainWindow inherits Window {
     callback collection-tree-row-clicked(int);    // expand/collapse toggle
     callback collection-tree-row-selected(int);   // select as active filter
     callback collection-all-items-clicked();
+    callback collection-search-requested();
     callback vault-item-clicked(int);
     callback search-requested();
     callback toggle-password-visibility();
@@ -383,7 +386,8 @@ export component MainWindow inherits Window {
                     vertical-stretch: 1;
 
                     Rectangle {
-                        width: 200px;
+                        min-width: 220px;
+                        horizontal-stretch: 1;
                         background: root.color-bg-elevated;
                         border-width: 1px;
                         border-color: root.color-border;
@@ -401,6 +405,23 @@ export component MainWindow inherits Window {
                                 color: root.color-text-primary;
                                 font-size: 14px;
                                 font-weight: 700;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 6px;
+
+                                LineEdit {
+                                    horizontal-stretch: 1;
+                                    text <=> root.collection-search-query;
+                                    placeholder-text: "Search collections";
+                                }
+
+                                Button {
+                                    text: "Search";
+                                    clicked => {
+                                        root.collection-search-requested();
+                                    }
+                                }
                             }
 
                             // "All Items" — clears any active collection filter
@@ -490,7 +511,7 @@ export component MainWindow inherits Window {
                             }
 
                             Text {
-                                text: root.collection-tree-rows.length > 0 ? "" : "No collections loaded.";
+                                text: root.collection-tree-rows.length > 0 ? "" : (root.has-active-collection-search ? "No collections match your search." : "No collections loaded.");
                                 color: root.color-text-muted;
                                 font-size: 12px;
                             }
@@ -498,7 +519,8 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle {
-                        width: 300px;
+                        min-width: 220px;
+                        horizontal-stretch: 1;
                         background: root.color-bg-elevated;
                         border-width: 1px;
                         border-color: root.color-border;
@@ -566,7 +588,7 @@ export component MainWindow inherits Window {
                     }
 
                     Rectangle {
-                        horizontal-stretch: 1;
+                        horizontal-stretch: 2;
                         background: root.color-bg-subtle;
                         border-width: 1px;
                         border-color: root.color-border;

@@ -385,6 +385,7 @@ struct CollectionTreeState {
     root: TreeNode,
     expanded_nodes: HashSet<String>,
     visible_rows: Vec<crate::CollectionTreeRow>,
+    filter_query: Option<String>,
 }
 
 impl CollectionTreeState {
@@ -406,6 +407,7 @@ impl CollectionTreeState {
             root,
             expanded_nodes,
             visible_rows: Vec::new(),
+            filter_query: None,
         };
         state.rebuild_rows();
         state
@@ -448,9 +450,25 @@ impl CollectionTreeState {
         ModelRc::new(VecModel::from(self.visible_rows.clone()))
     }
 
+    fn set_filter_query(&mut self, raw_query: &str) {
+        let query = raw_query.trim().to_lowercase();
+        self.filter_query = if query.is_empty() { None } else { Some(query) };
+        self.rebuild_rows();
+    }
+
+    fn is_path_visible(&self, path: &str) -> bool {
+        self.visible_rows
+            .iter()
+            .any(|row| row.id.to_string() == path)
+    }
+
     fn rebuild_rows(&mut self) {
         let mut rows = Vec::new();
-        flatten_tree(&self.root, "", 0, &self.expanded_nodes, &mut rows);
+        if let Some(query) = self.filter_query.as_deref() {
+            flatten_tree_filtered(&self.root, "", 0, query, false, &mut rows);
+        } else {
+            flatten_tree(&self.root, "", 0, &self.expanded_nodes, &mut rows);
+        }
         self.visible_rows = rows;
     }
 }
@@ -509,6 +527,57 @@ fn flatten_tree(
             flatten_tree(child, &id, depth + 1, expanded, rows);
         }
     }
+}
+
+/// Build filtered rows while preserving ancestor paths and full descendants
+/// for each matching node.
+fn flatten_tree_filtered(
+    node: &TreeNode,
+    prefix: &str,
+    depth: i32,
+    query: &str,
+    ancestor_matches: bool,
+    rows: &mut Vec<crate::CollectionTreeRow>,
+) -> bool {
+    let mut subtree_has_match = false;
+
+    for (name, child) in &node.children {
+        let id = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+
+        let name_matches = name.to_lowercase().contains(query);
+        let mut child_rows = Vec::new();
+        let child_has_match = flatten_tree_filtered(
+            child,
+            &id,
+            depth + 1,
+            query,
+            ancestor_matches || name_matches,
+            &mut child_rows,
+        );
+        let include_node = ancestor_matches || name_matches || child_has_match;
+
+        if include_node {
+            let has_children = !child_rows.is_empty();
+            rows.push(crate::CollectionTreeRow {
+                id: id.clone().into(),
+                label: name.clone().into(),
+                depth,
+                has_children,
+                is_expanded: has_children,
+            });
+            rows.extend(child_rows);
+        }
+
+        if name_matches || child_has_match {
+            subtree_has_match = true;
+        }
+    }
+
+    subtree_has_match
 }
 
 pub(super) fn attach_handlers(window: &crate::MainWindow) {
@@ -667,6 +736,86 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
                     crate::VaultItemFieldRow,
                 >::default()));
                 window.set_selected_vault_item_empty_text("No vault items loaded.".into());
+                window.set_selected_has_password(false);
+            } else if let Some(item) = items_ref.get(next_indices[0]) {
+                apply_selected_item(&window, 0, item, false);
+            }
+        });
+    }
+
+    {
+        let weak_window = weak_window.clone();
+        let tree_state = tree_state.clone();
+        let vault_item_state = vault_item_state.clone();
+        let visible_item_indices_state = visible_item_indices_state.clone();
+        let password_visible_state = password_visible_state.clone();
+        let active_collection_id = active_collection_id.clone();
+
+        window.on_collection_search_requested(move || {
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+
+            let collection_search_query = window.get_collection_search_query().to_string();
+            let has_active_collection_search = !collection_search_query.trim().is_empty();
+            window.set_has_active_collection_search(has_active_collection_search);
+
+            let active_collection_path = active_collection_id.lock().ok().and_then(|g| g.clone());
+            let should_clear_active_collection = {
+                let Ok(mut state_ref) = tree_state.lock() else {
+                    return;
+                };
+                let Some(state) = state_ref.as_mut() else {
+                    return;
+                };
+                state.set_filter_query(&collection_search_query);
+                window.set_collection_tree_rows(state.to_model());
+                active_collection_path
+                    .as_deref()
+                    .map(|path| !state.is_path_visible(path))
+                    .unwrap_or(false)
+            };
+
+            if !should_clear_active_collection {
+                return;
+            }
+
+            if let Ok(mut active_ref) = active_collection_id.lock() {
+                *active_ref = None;
+            }
+            window.set_active_collection_id("".into());
+
+            let item_search_query = window.get_search_query().to_string();
+            let has_active_item_search = !item_search_query.trim().is_empty();
+
+            let Ok(items_ref) = vault_item_state.lock() else {
+                return;
+            };
+            let next_indices = build_visible_item_indices(&items_ref, &item_search_query, None);
+            window.set_vault_item_rows(model_from_item_rows(&items_ref, &next_indices));
+
+            if let Ok(mut visible_ref) = visible_item_indices_state.lock() {
+                *visible_ref = next_indices.clone();
+            }
+            if let Ok(mut pw) = password_visible_state.lock() {
+                *pw = false;
+            }
+            window.set_is_password_visible(false);
+
+            if next_indices.is_empty() {
+                window.set_selected_vault_item_index(-1);
+                window.set_selected_vault_item_title("".into());
+                window.set_selected_vault_item_fields(ModelRc::new(VecModel::<
+                    crate::VaultItemFieldRow,
+                >::default()));
+                window.set_selected_vault_item_empty_text(
+                    if has_active_item_search {
+                        "No vault items match your search."
+                    } else {
+                        "No vault items loaded."
+                    }
+                    .into(),
+                );
                 window.set_selected_has_password(false);
             } else if let Some(item) = items_ref.get(next_indices[0]) {
                 apply_selected_item(&window, 0, item, false);
@@ -870,6 +1019,8 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
         window.set_status_text("Logging in...".into());
         window.set_is_logging_in(true);
         window.set_is_vault_view(false);
+        window.set_collection_search_query("".into());
+        window.set_has_active_collection_search(false);
         window.set_search_query("".into());
         window.set_has_active_search(false);
         window.set_collection_tree_rows(ModelRc::new(
@@ -1156,6 +1307,8 @@ pub(super) fn attach_handlers(window: &crate::MainWindow) {
             window.set_status_is_error(false);
             window.set_status_text("Decrypting vault...".into());
             window.set_is_logging_in(true);
+            window.set_collection_search_query("".into());
+            window.set_has_active_collection_search(false);
             window.set_search_query("".into());
             window.set_has_active_search(false);
 
@@ -1311,6 +1464,8 @@ fn populate_vault_after_login(
     window.set_is_sso_awaiting_password(false);
     window.set_is_tde_awaiting_approval(false);
     window.set_tde_fingerprint("".into());
+    window.set_collection_search_query("".into());
+    window.set_has_active_collection_search(false);
     window.set_search_query("".into());
     window.set_has_active_search(false);
     window.set_active_collection_id("".into());
@@ -1554,8 +1709,8 @@ fn schedule_totp_refresh(
 #[cfg(test)]
 mod tests {
     use super::{
-        VaultItemUiState, build_visible_item_indices, decode_base32_secret, generate_totp_code,
-        parse_totp_config,
+        CollectionTreeState, VaultItemUiState, build_visible_item_indices, decode_base32_secret,
+        generate_totp_code, parse_totp_config,
     };
 
     #[test]
@@ -1618,5 +1773,60 @@ mod tests {
             build_visible_item_indices(&items, "JBSWY3DPEHPK3PXP", None),
             Vec::<usize>::new()
         );
+    }
+
+    #[test]
+    fn collection_search_keeps_ancestors_and_descendants() {
+        let collections = vec![
+            ("id-1".to_string(), "Work/Prod/API".to_string()),
+            ("id-2".to_string(), "Work/Dev".to_string()),
+            ("id-3".to_string(), "Personal/Home".to_string()),
+        ];
+
+        let mut state = CollectionTreeState::from_collections(&collections);
+        state.set_filter_query("prod");
+        let ids: Vec<String> = state
+            .visible_rows
+            .iter()
+            .map(|row| row.id.to_string())
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec![
+                "Work".to_string(),
+                "Work/Prod".to_string(),
+                "Work/Prod/API".to_string()
+            ]
+        );
+        assert!(!state.is_path_visible("Work/Dev"));
+    }
+
+    #[test]
+    fn collection_search_match_on_parent_includes_full_subtree() {
+        let collections = vec![
+            ("id-1".to_string(), "Work/Prod/API".to_string()),
+            ("id-2".to_string(), "Work/Dev".to_string()),
+            ("id-3".to_string(), "Personal/Home".to_string()),
+        ];
+
+        let mut state = CollectionTreeState::from_collections(&collections);
+        state.set_filter_query("work");
+        let ids: Vec<String> = state
+            .visible_rows
+            .iter()
+            .map(|row| row.id.to_string())
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec![
+                "Work".to_string(),
+                "Work/Dev".to_string(),
+                "Work/Prod".to_string(),
+                "Work/Prod/API".to_string()
+            ]
+        );
+        assert!(!state.is_path_visible("Personal"));
     }
 }

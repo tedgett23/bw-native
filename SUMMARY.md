@@ -1,6 +1,6 @@
 # bw-native — Codebase Summary
 
-A native Bitwarden vault client built in Rust using [Slint](https://slint.dev/) for the UI. It supports logging in to official Bitwarden servers (cloud and EU), Vaultwarden, and generic self-hosted instances. The app syncs and decrypts the full vault client-side (zero-knowledge), then presents it in a three-panel dark-themed desktop UI with collection browsing, item search, and live TOTP code generation.
+A native Bitwarden vault client built in Rust using [Slint](https://slint.dev/) for the UI. It supports logging in to official Bitwarden servers (cloud and EU), Vaultwarden, and generic self-hosted instances. The app syncs and decrypts the full vault client-side (zero-knowledge), then presents it in a three-panel dark-themed desktop UI with collection browsing, collection/item search, and live TOTP code generation.
 
 **Current state:** Read-only. The app can authenticate (password login, SSO with master password, or SSO with Trusted Device Encryption), sync, and display vault contents but cannot create, edit, or delete items.
 
@@ -26,7 +26,7 @@ bw-native/
 │   │   └── workflow.rs         # High-level password login orchestration
 │   └── ui/                     # Slint ↔ Rust glue
 │       ├── mod.rs              # Creates MainWindow and starts event loop
-│       └── login_controller.rs # All UI event handlers, TOTP generation, search, TDE polling (~1,500 lines)
+│       └── login_controller.rs # All UI event handlers, TOTP generation, collection/item search, TDE polling (~1,500 lines)
 └── ui/
     └── app-window.slint        # Complete UI definition (login + SSO + TDE approval + vault views, ~700 lines)
 ```
@@ -121,6 +121,9 @@ User enters server URL, email, and SSO org identifier
 ```
 Path b — Already trusted device:
   ├─ Load device key from ~/.config/bw-native/device_key.json
+  │     File contains device_identifier (UUID) and 32-byte AES key (Base64)
+  ├─ Token request sends the stored device_identifier so the server returns
+  │     trustedDeviceOption.encryptedPrivateKey + encryptedUserKey
   ├─ Decrypt encryptedPrivateKey (from trustedDeviceOption) with device key (AES-256-CBC + HMAC)
   ├─ Decrypt encryptedUserKey with RSA private key (OAEP-SHA1)
   └─ Use raw 64-byte user key to sync and decrypt vault directly
@@ -128,23 +131,39 @@ Path b — Already trusted device:
 Path c — New device (needs approval):
   ├─ Generate ephemeral RSA-2048 keypair + 25-char access code
   ├─ Compute fingerprint phrase (5 words, shown to approver for verification)
-  ├─ POST /api/auth-requests          (type 0, unauthenticated — device approval)
+  ├─ POST /api/auth-requests  (type 0, unauthenticated — device approval)
+  │     Requires Device-Type: 8 HTTP header (server reads deviceType from header, not body)
   ├─ POST /api/auth-requests/admin-request  (type 2, bearer token — admin approval)
+  │     Also requires Device-Type: 8 header
   ├─ Show "Approve from Another Device" UI with fingerprint
   ├─ Poll every 10 seconds:
   │   Device approval: GET /api/auth-requests/{id}/response?code={access_code}  (no auth)
   │   Admin approval:  GET /api/auth-requests/{id}  (bearer token)
   ├─ On approval: RSA-decrypt user key from response
   ├─ Sync and decrypt vault with user key
-  └─ Register device trust (PUT /api/devices/identifier/{new_id}/trust)
-        Generates new permanent device key
-        Encrypts: private key with device key, public key with user key, user key with RSA public key
-        Persists device key to ~/.config/bw-native/device_key.json
-        Future logins on this device will use Path b (auto-decrypt)
+  └─ Register device trust  (PUT /api/devices/{device_identifier}/keys)
+        Uses the SAME device_identifier sent during the token request (server finds
+        the device record by this identifier; creating a new UUID would fail with 404)
+        Generates a new permanent device key (32 bytes, random)
+        Generates a new permanent RSA-2048 keypair (separate from the ephemeral one)
+        Body: { EncryptedUserKey, EncryptedPublicKey, EncryptedPrivateKey }  (PascalCase)
+          encryptedUserKey    = user key encrypted with permanent RSA public key  (prefix "4.")
+          encryptedPublicKey  = permanent RSA public key encrypted with user key  (type-2)
+          encryptedPrivateKey = permanent RSA private key encrypted with device key (type-2)
+        Persists device key + device_identifier to ~/.config/bw-native/device_key.json
+        Future logins send the stored device_identifier → server returns encryptedPrivateKey
+        and encryptedUserKey → Path b (auto-decrypt)
 
 Path a — Master password:
   └─ Same as password login steps 3–6 above (derive master key, decrypt vault)
 ```
+
+**Key protocol notes confirmed against bitwarden/server and bitwarden/clients source:**
+- `DeviceType` is read by the server from the `Device-Type` HTTP request header, not the JSON body. The `device_type` field in the `CreateAuthRequest` body is ignored by the official server.
+- The device trust endpoint is `PUT /devices/{identifier}/keys`, not `/devices/identifier/{id}/trust`.
+- The trust endpoint looks up the device by identifier from the token request; using a different identifier returns 404.
+- `DeviceKeysRequestModel` (server) / `TrustedDeviceKeysRequest` (client) has only three fields: `EncryptedUserKey`, `EncryptedPublicKey`, `EncryptedPrivateKey`. Fields like `name`, `type`, `identifier` are not part of the keys update body.
+- The permanent keypair stored in the trust record must be distinct from the ephemeral keypair used for the one-time auth-request approval.
 
 ### Cryptographic Details (vault.rs + device_trust.rs)
 
@@ -179,9 +198,9 @@ Path a — Master password:
 
 **Vault View** — Three-column layout:
 
-| Collections Panel (200px) | Items Panel (300px) | Details Panel (flex) |
+| Collections Panel (min 220px, flex 1) | Items Panel (min 220px, flex 1) | Details Panel (flex 2) |
 |---|---|---|
-| Hierarchical tree with expand/collapse and collection filtering | Searchable list with selection highlighting | Item title, credential fields, metadata |
+| Hierarchical tree with expand/collapse, collection filter selection, and collection search | Searchable list with selection highlighting | Item title, credential fields, metadata |
 
 ### Slint Structs (shared with Rust)
 
@@ -194,7 +213,8 @@ Path a — Master password:
 - `collection-tree-row-clicked(int)` — fired by the `>` expand/collapse arrow; toggles tree expand state only
 - `collection-tree-row-selected(int)` — fired by clicking the collection label; sets or clears the active collection filter
 - `collection-all-items-clicked()` — fired by the "All Items" row at the top of the tree; clears the collection filter
-- `vault-item-clicked(int)`, `search-requested()`, `toggle-password-visibility()` — item panel interactions
+- `collection-search-requested()` — applies case-insensitive collection tree filtering
+- `vault-item-clicked(int)`, `search-requested()`, `toggle-password-visibility()` — item panel interactions (`search-requested` filters items)
 
 ### Color Palette (dark theme)
 
@@ -204,10 +224,11 @@ All colors are hardcoded constants in the `.slint` file (e.g., `#0a111d` backgro
 
 ## Controller Features (login_controller.rs)
 
-- **Search:** Case-insensitive filtering across item labels and field values. Passwords and TOTP secrets are excluded from search for security.
+- **Item search:** Case-insensitive filtering across item labels and field values. Passwords and TOTP secrets are excluded from search for security.
+- **Collection search:** Case-insensitive filtering on collection labels. Matching keeps tree structure by retaining ancestor paths and rendering descendants under matched nodes.
 - **TOTP generation:** Parses `otpauth://` URIs and raw Base32 secrets. Supports SHA1/SHA256/SHA512, configurable digits and period. Auto-refreshes every second via `slint::Timer`. Formats codes as "123 456".
 - **Collection tree:** Builds a hierarchical tree from `(uuid, name_path)` pairs. Each `TreeNode` stores the Bitwarden UUIDs of collections whose name path ends at that node. Supports expand/collapse toggling (via arrow click) independently from collection selection (via label click). `collect_uuids_for_path` walks the tree to gather UUIDs for a node and all its descendants, enabling parent-level filtering.
-- **Collection filtering:** `active_collection_id: Arc<Mutex<Option<String>>>` holds the name-path of the currently selected tree node. Item visibility is computed by checking whether any of the item's `collection_ids` (Bitwarden UUIDs) intersect the resolved UUID set for the active node. Composes with search: both filters apply simultaneously. An "All Items" entry clears the filter. Clicking an already-selected node deselects it.
+- **Collection filtering:** `active_collection_id: Arc<Mutex<Option<String>>>` holds the name-path of the currently selected tree node. Item visibility is computed by checking whether any of the item's `collection_ids` (Bitwarden UUIDs) intersect the resolved UUID set for the active node. Composes with item search: both filters apply simultaneously. An "All Items" entry clears the filter. Clicking an already-selected node deselects it. If collection search hides the selected node, the active collection selection is cleared.
 - **Password visibility:** Toggle between masked (`********`) and plaintext display.
 - **SSO state management:** `SsoPendingState` holds the access token, encrypted user key, KDF config, and HTTP client between SSO token exchange and master password submission.
 - **TDE state management:** `TdePendingState` holds the access token, auth request IDs, access code, ephemeral RSA private key, and HTTP client while waiting for device/admin approval. A 10-second `slint::Timer` polls the approval endpoints on a background thread and auto-completes the vault unlock when approved.
@@ -315,7 +336,7 @@ struct TrustedDeviceOption { encrypted_private_key, encrypted_user_key, has_admi
 struct AuthRequestResponse { id, public_key, fingerprint_phrase }
 struct AuthRequestApprovalResponse { id, approved, encrypted_user_key, request_approved }
 struct CreateAuthRequest { email, public_key, device_identifier, access_code, type, device_type }
-struct TrustDeviceRequest { name, identifier, type, encrypted_user_key, encrypted_public_key, encrypted_private_key }
+struct TrustDeviceRequest { encrypted_user_key, encrypted_public_key, encrypted_private_key }  // PUT /devices/{id}/keys
 struct SsoPreValidateResponse { token }
 ```
 
@@ -356,4 +377,4 @@ Requires a Rust toolchain with edition 2024 support.
 
 ## TODO
 
-No open items.
+- Send audit events to the Bitwarden server when a user opens an item or reveals/views a password.
